@@ -1,0 +1,8 @@
+{
+  "name": "@org/super-admin-portal",
+  "version": "0.0.1",
+  "private": true,
+  "nx": {
+    "name": "super-admin-portal"
+  }
+}

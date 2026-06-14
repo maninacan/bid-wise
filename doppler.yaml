@@ -1,0 +1,3 @@
+setup:
+  project: bid-wise
+  config: dev_personal

@@ -1,0 +1,41 @@
+{
+  "start": "contractor-type",
+
+  "questions": {
+    "contractor-type": {
+      "id": "contractor-type",
+      "select": "multiple",
+      "text": "Select which part of the build process you want to get takeoffs for.",
+      "choices": [
+        { "label": "General Contractor",         "value": "gc",          "next": "done", "specialAction": { "type": "select-all", "except": [] } },
+        { "label": "Plumbing",                   "value": "plumbing",    "next": "done" },
+        { "label": "Electrical",                 "value": "electrical",  "next": "done" },
+        { "label": "HVAC / Mechanical",          "value": "hvac",        "next": "done" },
+        { "label": "Landscaping / Hardscaping",  "value": "landscape",   "next": "done" },
+        { "label": "Painting / Coatings",        "value": "painting",    "next": "done" },
+        { "label": "Drywall / Plastering",       "value": "drywall",     "next": "done" },
+        { "label": "Flooring",                   "value": "flooring",    "next": "done" },
+        { "label": "Roofing",                    "value": "roofing",     "next": "done" },
+        { "label": "Concrete / Masonry",         "value": "concrete",    "next": "done" },
+        { "label": "Framing / Carpentry",        "value": "framing",     "next": "done" },
+        { "label": "Tile / Stone",               "value": "tile",        "next": "done" },
+        { "label": "Cabinetry",                  "value": "cabinetry",   "next": "done" },
+        { "label": "Appliances",                 "value": "appliances",  "next": "done" },
+        { "label": "Finish Work",                "value": "finish-work", "next": "done" }
+      ],
+      "passthrough": "takeoffs"
+    }
+  },
+
+  "results": {
+    "done": {
+      "id": "done",
+      "bidProfile": "Takeoff complete",
+      "pricingModel": "lump-sum",
+      "description": "Your takeoffs have been generated.",
+      "typicalLineItems": [],
+      "permitLikelihood": "rare",
+      "tags": []
+    }
+  }
+}

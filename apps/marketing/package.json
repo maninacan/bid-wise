@@ -1,0 +1,9 @@
+{
+  "name": "marketing",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "astro": "^6.4.6"
+  }
+}

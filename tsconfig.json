@@ -1,0 +1,31 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compileOnSave": false,
+  "files": [],
+  "references": [
+    {
+      "path": "./apps/client-e2e"
+    },
+    {
+      "path": "./apps/client"
+    },
+    {
+      "path": "./apps/super-admin-portal-e2e"
+    },
+    {
+      "path": "./apps/super-admin-portal"
+    },
+    {
+      "path": "./apps/api"
+    },
+    {
+      "path": "./apps/marketing"
+    },
+    {
+      "path": "./libs/common-components"
+    },
+    {
+      "path": "./libs/data"
+    }
+  ]
+}
