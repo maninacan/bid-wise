@@ -224,7 +224,7 @@ export function App() {
 
             <Route
               path="/projects/:planId/questionnaire"
-              element={<QuestionnaireForPlan pricingMatrix={settings.pricingMatrix} trades={settings.trades} />}
+              element={<QuestionnaireForPlan plans={existingPlans} pricingMatrix={settings.pricingMatrix} trades={settings.trades} />}
             />
 
             <Route

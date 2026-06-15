@@ -7,7 +7,7 @@ import { typeDefs } from './graphql/schema';
 import { resolvers } from './graphql/resolvers';
 import type { GqlContext } from './graphql/context';
 import { createGraphqlRouter } from './routes/graphql.route';
-import { takeoffRouter } from './routes/takeoff.route';
+import { takeoffRouter, cancelTakeoffRouter } from './routes/takeoff.route';
 
 async function startServer() {
   const app = express();
@@ -32,6 +32,7 @@ async function startServer() {
 
   app.use('/graphql', createGraphqlRouter(server));
   app.use('/generate-takeoff', takeoffRouter);
+  app.use('/cancel-takeoff', cancelTakeoffRouter);
 
   const host = process.env.HOST ?? 'localhost';
   const port = process.env.PORT ? Number(process.env.PORT) : 4000;

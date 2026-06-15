@@ -98,11 +98,15 @@ export interface BidData {
   aiPricesZipCode?: string;
   /** trade name → delegation (sub id + their quoted prices) */
   delegations?: Record<string, DelegationData>;
+  /** Trades excluded from this bid — their subtotals are dropped from the grand total. */
+  excludedTrades?: string[];
   overheadPct: number;
   profitPct: number;
   contingencyPct: number;
   updatedAt?: string;
   finalizedAt?: string;
+  /** ISO timestamp when the finalized bid was sent to the customer. Locks the project. */
+  sentAt?: string;
 }
 
 export interface TradeOverride {
@@ -139,6 +143,8 @@ export interface TakeoffData {
   sections: TakeoffSection[];
   /** Gaps may be legacy strings (old takeoffs) or structured TakeoffGap objects. */
   gaps: (TakeoffGap | string)[];
+  /** AI-generated meanings for abbreviations/acronyms used in this takeoff. */
+  acronyms?: { abbreviation: string; meaning: string }[];
   materialsSelectedTrades?: string[];
   /** `${trade}::${description}` → overridden quantity */
   materialsQuantityOverrides?: Record<string, number>;
@@ -199,6 +205,37 @@ export async function getTakeoff(id: string): Promise<Takeoff> {
   return data;
 }
 
+/** Returns a finalized (non-archived) takeoff for the plan, if one exists. Used to mark
+ *  the other takeoffs as superseded once a bid has been committed. RLS-scoped to the user. */
+export async function getFinalizedTakeoffForPlan(planId: string): Promise<Takeoff | null> {
+  const { data, error } = await supabase
+    .from('takeoffs')
+    .select('id, plan_id, model, data, created_at')
+    .eq('plan_id', planId)
+    .eq('archived', false)
+    .not('data->bid->>finalizedAt', 'is', null)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data ?? null;
+}
+
+/** True if any non-archived takeoff for the plan has a bid that was sent to the customer.
+ *  Used to lock the project from new takeoffs. RLS-scoped to the user. */
+export async function planHasSentBid(planId: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('takeoffs')
+    .select('id')
+    .eq('plan_id', planId)
+    .eq('archived', false)
+    .not('data->bid->>sentAt', 'is', null)
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return !!data;
+}
+
 /** Pulls a human-readable message out of an ApolloError (GraphQL or network), with
  *  the same timeout-friendly mapping the edge-function caller used to apply. */
 function gqlErrorMessage(error: unknown, fallback: string): string {
@@ -228,12 +265,114 @@ async function authContext(): Promise<{ headers: Record<string, string> }> {
 
 export type TakeoffPhase = 'reading' | 'analyzing' | 'compiling' | 'saving';
 
+const TAKEOFF_JOB_STALE_MS = 10 * 60 * 1000;
+
+export interface TakeoffJob {
+  id: string;
+  plan_id: string;
+  status: 'running' | 'done' | 'error' | 'canceled';
+  phase: TakeoffPhase | null;
+  trades: string[];
+  narration: string | null;
+  error: string | null;
+  takeoff_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+const TAKEOFF_JOB_COLUMNS = 'id, plan_id, status, phase, trades, narration, error, takeoff_id, created_at, updated_at';
+
+/** Returns the active (running, non-stale) generation job for a plan, or null.
+ *  RLS scopes the query to the current user. */
+export async function getActiveTakeoffJob(planId: string): Promise<TakeoffJob | null> {
+  const { data, error } = await supabase
+    .from('takeoff_jobs')
+    .select(TAKEOFF_JOB_COLUMNS)
+    .eq('plan_id', planId)
+    .eq('status', 'running')
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  if (!data) return null;
+  // Mirror the server's staleness rule so a crashed run doesn't look active.
+  if (Date.now() - new Date(data.updated_at).getTime() > TAKEOFF_JOB_STALE_MS) return null;
+  return data as TakeoffJob;
+}
+
+/** All active (running, non-stale) generation jobs for the current user, across plans.
+ *  Used by the multi-plan (no specific plan) questionnaire flow. */
+export async function getActiveTakeoffJobs(): Promise<TakeoffJob[]> {
+  const { data, error } = await supabase
+    .from('takeoff_jobs')
+    .select(TAKEOFF_JOB_COLUMNS)
+    .eq('status', 'running')
+    .order('updated_at', { ascending: false });
+  if (error) throw error;
+  const now = Date.now();
+  return (data ?? []).filter(
+    (j) => now - new Date(j.updated_at).getTime() <= TAKEOFF_JOB_STALE_MS,
+  ) as TakeoffJob[];
+}
+
+function authorizeRealtime(): void {
+  void supabase.auth.getSession().then(({ data: { session } }) => {
+    if (session?.access_token) supabase.realtime.setAuth(session.access_token);
+  });
+}
+
+/** Subscribes to takeoff_jobs changes for a plan via Realtime. Returns an unsubscribe fn.
+ *  Authorizes the Realtime connection with the current session so RLS applies. */
+export function subscribeTakeoffJob(
+  planId: string,
+  onChange: (job: TakeoffJob) => void,
+): () => void {
+  authorizeRealtime();
+  const channel = supabase
+    .channel(`takeoff_job:${planId}`)
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'takeoff_jobs', filter: `plan_id=eq.${planId}` },
+      (payload) => {
+        if (payload.new && 'id' in payload.new) onChange(payload.new as TakeoffJob);
+      },
+    )
+    .subscribe();
+  return () => { void supabase.removeChannel(channel); };
+}
+
+/** Subscribes to all of the current user's takeoff_jobs changes (RLS-scoped). */
+export function subscribeUserTakeoffJobs(onChange: (job: TakeoffJob) => void): () => void {
+  authorizeRealtime();
+  const channel = supabase
+    .channel('takeoff_jobs:user')
+    .on(
+      'postgres_changes',
+      { event: '*', schema: 'public', table: 'takeoff_jobs' },
+      (payload) => {
+        if (payload.new && 'id' in payload.new) onChange(payload.new as TakeoffJob);
+      },
+    )
+    .subscribe();
+  return () => { void supabase.removeChannel(channel); };
+}
+
 type TakeoffStreamEvent =
   | { type: 'phase'; phase: TakeoffPhase }
   | { type: 'token'; text: string }
   | { type: 'progress'; trades: string[]; count: number }
   | { type: 'done'; takeoff: Takeoff }
+  | { type: 'canceled' }
   | { type: 'error'; error: string };
+
+/** Thrown by generateTakeoff when the user cancels the run. Callers should treat this
+ *  as a clean stop (reset the UI) rather than a generation failure. */
+export class TakeoffCanceledError extends Error {
+  constructor() {
+    super('Takeoff generation canceled.');
+    this.name = 'TakeoffCanceledError';
+  }
+}
 
 export interface TakeoffStreamHandlers {
   /** Fired on each progress milestone. */
@@ -285,6 +424,8 @@ export async function generateTakeoff(
         handlers?.onProgress?.(event.trades, event.count);
       } else if (event.type === 'done') {
         return event.takeoff;
+      } else if (event.type === 'canceled') {
+        throw new TakeoffCanceledError();
       } else if (event.type === 'error') {
         const msg = event.error.toLowerCase().includes('timeout')
           ? 'The request timed out — this can happen for large plans. Please try again.'
@@ -294,6 +435,30 @@ export async function generateTakeoff(
     }
   }
   throw new Error('Takeoff generation failed.');
+}
+
+/** Requests cancellation of the in-progress takeoff generation for a plan. The running
+ *  server stream polls for this and stops; the live generateTakeoff call then rejects
+ *  with TakeoffCanceledError (or, for a reattached run, the job row flips to 'canceled'). */
+export async function cancelTakeoff(planId: string): Promise<void> {
+  const { data: { session } } = await supabase.auth.getSession();
+  const res = await fetch(`${apiUrl}/cancel-takeoff`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${session?.access_token ?? supabaseKey}`,
+    },
+    body: JSON.stringify({ plan_id: planId }),
+  });
+  if (!res.ok) throw new Error('Failed to cancel takeoff.');
+}
+
+/** Cancels every in-progress takeoff for the current user. Used by the multi-plan
+ *  questionnaire flow, which generates across all plans and has no single plan id. */
+export async function cancelAllActiveTakeoffs(): Promise<void> {
+  const jobs = await getActiveTakeoffJobs();
+  const planIds = [...new Set(jobs.map((j) => j.plan_id))];
+  await Promise.all(planIds.map((id) => cancelTakeoff(id)));
 }
 
 export interface ClarificationInput {
@@ -441,6 +606,37 @@ export async function finalizeBid(takeoffId: string): Promise<TakeoffData> {
     .single();
   if (error) throw error;
   if (!saved) throw new Error('Finalize returned no data');
+
+  return saved.data as TakeoffData;
+}
+
+/** Clears finalizedAt, reopening a finalized bid for edits. Refuses once the bid has
+ *  been sent to the customer (that lock is permanent). */
+export async function unfinalizeBid(takeoffId: string): Promise<TakeoffData> {
+  const { data: row, error: fetchError } = await supabase
+    .from('takeoffs')
+    .select('data')
+    .eq('id', takeoffId)
+    .single();
+  if (fetchError || !row) throw fetchError ?? new Error('Takeoff not found');
+
+  const existing = row.data as TakeoffData;
+  if (!existing.bid?.finalizedAt) return existing; // already open — nothing to do
+  if (existing.bid.sentAt) {
+    throw new Error('This bid has been sent to the customer and can no longer be changed.');
+  }
+  const bid = { ...existing.bid, updatedAt: new Date().toISOString() };
+  delete bid.finalizedAt;
+  const updatedData: TakeoffData = { ...existing, bid };
+
+  const { data: saved, error } = await supabase
+    .from('takeoffs')
+    .update({ data: updatedData })
+    .eq('id', takeoffId)
+    .select('data')
+    .single();
+  if (error) throw error;
+  if (!saved) throw new Error('Un-finalize returned no data');
 
   return saved.data as TakeoffData;
 }

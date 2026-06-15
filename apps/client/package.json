@@ -4,5 +4,8 @@
   "private": true,
   "nx": {
     "name": "client"
+  },
+  "dependencies": {
+    "@popperjs/core": "^2.11.8"
   }
 }

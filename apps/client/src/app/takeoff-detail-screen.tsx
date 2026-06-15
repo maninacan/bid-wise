@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import type { BidSharingMode, HousePlan, PricingMatrix, Subcontractor, Takeoff } from '../lib/supabase';
-import { getTakeoff } from '../lib/supabase';
+import { getFinalizedTakeoffForPlan, getTakeoff } from '../lib/supabase';
 import { TakeoffView } from './takeoff-view';
 
 interface TakeoffDetailScreenProps {
@@ -25,6 +25,7 @@ export function TakeoffDetailScreen({
   const navigate = useNavigate();
   const [takeoff, setTakeoff] = useState<Takeoff | null>(null);
   const [loading, setLoading] = useState(true);
+  const [finalizedSibling, setFinalizedSibling] = useState<Takeoff | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -34,6 +35,17 @@ export function TakeoffDetailScreen({
       .catch(() => navigate(-1))
       .finally(() => setLoading(false));
   }, [id, navigate]);
+
+  // A finalized takeoff elsewhere in this plan supersedes (locks) this one.
+  useEffect(() => {
+    if (!takeoff) return;
+    getFinalizedTakeoffForPlan(takeoff.plan_id).then(setFinalizedSibling).catch(() => {});
+  }, [takeoff]);
+
+  const superseded =
+    !!finalizedSibling &&
+    finalizedSibling.id !== takeoff?.id &&
+    !takeoff?.data.bid?.finalizedAt;
 
   const plan = takeoff ? plans.find((p) => p.id === takeoff.plan_id) : null;
 
@@ -76,6 +88,7 @@ export function TakeoffDetailScreen({
         <TakeoffView
           takeoff={takeoff}
           planName={planName}
+          superseded={superseded}
           pricingMatrix={pricingMatrix}
           bidSharingMode={bidSharingMode}
           subcontractors={subcontractors}

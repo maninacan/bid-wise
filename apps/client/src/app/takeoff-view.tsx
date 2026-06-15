@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { createContext, useContext, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { format } from 'date-fns';
+import { Tooltip } from '@bid-wise/common-components';
 import type {
   BidData,
   BidSharingMode,
@@ -13,7 +14,7 @@ import type {
   TakeoffItem,
   TakeoffSection,
 } from '../lib/supabase';
-import { approveSubBid, clarifyTakeoff, finalizeBid, getLocalPricing, saveBid, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf } from '../lib/supabase';
+import { approveSubBid, clarifyTakeoff, finalizeBid, getLocalPricing, saveBid, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid } from '../lib/supabase';
 import { SubcontractorFormModal } from './subs-screen';
 
 /** Normalize legacy string gaps from old takeoffs to the structured format. */
@@ -26,6 +27,69 @@ const sourceBadgeStyles: Record<string, string> = {
   derived: 'bg-blue-100 text-blue-800',
   estimated: 'bg-amber-100 text-amber-800',
 };
+
+/** Spelled-out names for the bid unit abbreviations (see generate-takeoff). */
+const UNIT_LABELS: Record<string, string> = {
+  SF: 'Square feet',
+  SQ: 'Squares (100 sq ft of roofing)',
+  LF: 'Linear feet',
+  SY: 'Square yards',
+  CY: 'Cubic yards',
+  CF: 'Cubic feet',
+  EA: 'Each',
+  LS: 'Lump sum',
+  TON: 'Tons',
+  GAL: 'Gallons',
+  BF: 'Board feet',
+  PR: 'Pairs',
+  HR: 'Hours',
+};
+
+/** Abbreviation → meaning lookup for the current takeoff. Seeded with the canonical
+ *  units and augmented with the AI-generated acronyms from the takeoff itself. Keys are
+ *  uppercased. Provided by TakeoffView so any nested panel can resolve a tooltip. */
+const AcronymContext = createContext<Record<string, string>>(UNIT_LABELS);
+
+/** A unit abbreviation that spells itself out in a tooltip on hover. */
+function Unit({ value }: { value: string }) {
+  const acronyms = useContext(AcronymContext);
+  const label = acronyms[value?.toUpperCase()];
+  if (!label) return <>{value}</>;
+  return (
+    <Tooltip content={label} className="cursor-help">
+      {value}
+    </Tooltip>
+  );
+}
+
+/** Renders free text (a description or note), wrapping any token that is a known
+ *  acronym in a tooltip spelling it out. Only fully-uppercase tokens match, so plain
+ *  words are never wrapped. */
+function AcronymText({ text }: { text?: string }) {
+  const acronyms = useContext(AcronymContext);
+  if (!text) return null;
+  // Split on word boundaries, keeping the words and the separators between them.
+  const parts = text.split(/([A-Za-z0-9]+)/);
+  return (
+    <>
+      {parts.map((part, i) => {
+        const meaning = acronyms[part.toUpperCase()];
+        const isAcronym = !!meaning && /[A-Z]/.test(part) && part === part.toUpperCase();
+        return isAcronym ? (
+          <Tooltip
+            key={i}
+            content={meaning}
+            className="cursor-help underline decoration-dotted decoration-slate-300 underline-offset-2"
+          >
+            {part}
+          </Tooltip>
+        ) : (
+          part
+        );
+      })}
+    </>
+  );
+}
 
 // ── Tab bar ───────────────────────────────────────────────────────────────────
 
@@ -243,30 +307,30 @@ function TakeoffPanel({ data, pending, onVerify, readOnly = false }: TakeoffPane
           <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
             {section.trade}
           </h3>
-          <table className="mt-2 w-full text-sm">
+          <table className="mt-2 w-full table-fixed text-sm">
             <thead>
               <tr className="border-b border-slate-200 text-left text-xs uppercase text-slate-400">
                 <th className="py-1.5 pr-2 font-medium">Item</th>
-                <th className="py-1.5 pr-2 text-right font-medium">Qty</th>
-                <th className="py-1.5 pr-2 font-medium">Unit</th>
-                <th className="py-1.5 font-medium">Source</th>
+                <th className="w-20 py-1.5 pr-2 text-right font-medium">Qty</th>
+                <th className="w-16 py-1.5 pr-2 font-medium">Unit</th>
+                <th className="w-24 py-1.5 font-medium">Source</th>
               </tr>
             </thead>
             <tbody>
               {section.items.map((item, i) => (
                 <tr key={i} className="border-b border-slate-100 align-top">
                   <td className="py-1.5 pr-2 text-slate-700">
-                    {item.description}
+                    <AcronymText text={item.description} />
                     {item.notes && (
                       <span className="block text-xs text-slate-400">
-                        {item.notes}
+                        <AcronymText text={item.notes} />
                       </span>
                     )}
                   </td>
                   <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
                     {item.quantity.toLocaleString()}
                   </td>
-                  <td className="py-1.5 pr-2 text-slate-500">{item.unit}</td>
+                  <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
                   <td className="py-1.5">
                     <span
                       className={`rounded-full px-2 py-0.5 text-xs font-medium ${
@@ -338,9 +402,7 @@ interface MaterialsSection {
 }
 
 function itemGap(item: TakeoffItem): string {
-  return item.notes
-    ? `${item.description} — ${item.notes}`
-    : item.description;
+  return item.notes ? item.description + ' — ' + item.notes : item.description;
 }
 
 interface MaterialsPanelProps {
@@ -466,10 +528,10 @@ function MaterialsPanel({
                 return (
                   <tr key={i} className="border-b border-slate-100 align-top">
                     <td className="py-1.5 pr-2 text-slate-700">
-                      {item.description}
+                      <AcronymText text={item.description} />
                       {(item.notes || item.source === 'estimated') && (
                         <span className="block text-xs text-slate-400">
-                          {item.notes}
+                          <AcronymText text={item.notes} />
                           {item.source === 'estimated' && !readOnly && (
                             <>
                               {item.notes ? ' · ' : ''}
@@ -534,7 +596,7 @@ function MaterialsPanel({
                         />
                       )}
                     </td>
-                    <td className="py-1.5 text-slate-500">{item.unit}</td>
+                    <td className="py-1.5 text-slate-500"><Unit value={item.unit} /></td>
                   </tr>
                 );
               })}
@@ -915,7 +977,7 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                     onClick={() => setDelegateModalTrade(section.trade)}
                     className="rounded-full border border-slate-200 px-2 py-0.5 text-[10px] font-medium text-slate-400 transition-colors hover:border-slate-300 hover:text-slate-600"
                   >
-                    Delegate
+                    Delegate to Sub-contractor
                   </button>
                 )}
               </div>
@@ -931,14 +993,14 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                   {delegatedSub?.name ?? 'The subcontractor'} has not yet approved their bid.
                 </div>
               ) : (
-                <table className="mt-1.5 w-full text-sm">
+                <table className="mt-1.5 w-full table-fixed text-sm">
                   <thead>
                     <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                       <th className="py-1.5 pr-3 font-medium">Item</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">Qty</th>
-                      <th className="py-1.5 pr-3 font-medium">Unit</th>
-                      <th className="py-1.5 pr-3 text-right font-medium">Sub quote</th>
-                      <th className="py-1.5 text-right font-medium">Total</th>
+                      <th className="w-16 py-1.5 pr-3 text-right font-medium">Qty</th>
+                      <th className="w-16 py-1.5 pr-3 font-medium">Unit</th>
+                      <th className="w-28 py-1.5 pr-3 text-right font-medium">Sub quote</th>
+                      <th className="w-24 py-1.5 text-right font-medium">Total</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -949,15 +1011,15 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                       return (
                         <tr key={i} className="border-b border-slate-50 align-middle">
                           <td className="py-1.5 pr-3 text-slate-700">
-                            {item.description}
+                            <AcronymText text={item.description} />
                             {item.notes && (
-                              <span className="block text-xs text-slate-400">{item.notes}</span>
+                              <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                             )}
                           </td>
                           <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
                             {item.quantity.toLocaleString()}
                           </td>
-                          <td className="py-1.5 pr-3 text-slate-500">{item.unit}</td>
+                          <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                           <td className="py-1 pr-3">
                             <div className="flex items-center justify-end gap-0.5">
                               <span className="text-xs text-slate-400">$</span>
@@ -994,15 +1056,15 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
               )
             ) : (
               /* Non-delegated: AI price + override table */
-              <table className="mt-1.5 w-full text-sm">
+              <table className="mt-1.5 w-full table-fixed text-sm">
                 <thead>
                   <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                     <th className="py-1.5 pr-3 font-medium">Item</th>
-                    <th className="py-1.5 pr-3 text-right font-medium">Qty</th>
-                    <th className="py-1.5 pr-3 font-medium">Unit</th>
-                    <th className="py-1.5 pr-3 text-right font-medium">AI price</th>
-                    <th className="py-1.5 pr-3 text-right font-medium">Override</th>
-                    <th className="py-1.5 text-right font-medium">Total</th>
+                    <th className="w-16 py-1.5 pr-3 text-right font-medium">Qty</th>
+                    <th className="w-16 py-1.5 pr-3 font-medium">Unit</th>
+                    <th className="w-24 py-1.5 pr-3 text-right font-medium">AI price</th>
+                    <th className="w-28 py-1.5 pr-3 text-right font-medium">Override</th>
+                    <th className="w-24 py-1.5 text-right font-medium">Total</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1014,15 +1076,15 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                     return (
                       <tr key={i} className="border-b border-slate-50 align-middle">
                         <td className="py-1.5 pr-3 text-slate-700">
-                          {item.description}
+                          <AcronymText text={item.description} />
                           {item.notes && (
-                            <span className="block text-xs text-slate-400">{item.notes}</span>
+                            <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                           )}
                         </td>
                         <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
                           {item.quantity.toLocaleString()}
                         </td>
-                        <td className="py-1.5 pr-3 text-slate-500">{item.unit}</td>
+                        <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                         <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
                           {aiPrice != null ? fmt(aiPrice) : '—'}
                         </td>
@@ -1172,6 +1234,8 @@ function BidsPanel({
   const [finalizeConfirmOpen, setFinalizeConfirmOpen] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [finalizeError, setFinalizeError] = useState<string | null>(null);
+  const [unfinalizing, setUnfinalizing] = useState(false);
+  const [unfinalizeError, setUnfinalizeError] = useState<string | null>(null);
 
   const [shareOpen, setShareOpen] = useState(false);
   const [shareEmail, setShareEmail] = useState('');
@@ -1180,6 +1244,17 @@ function BidsPanel({
   const [sharing, setSharing] = useState(false);
   const [shareError, setShareError] = useState<string | null>(null);
   const [shareSuccess, setShareSuccess] = useState(false);
+  const [excludedTrades, setExcludedTrades] = useState<Set<string>>(
+    () => new Set(initialBid?.excludedTrades ?? []),
+  );
+
+  const toggleExcluded = (trade: string) =>
+    setExcludedTrades((prev) => {
+      const next = new Set(prev);
+      if (next.has(trade)) next.delete(trade);
+      else next.add(trade);
+      return next;
+    });
 
   const effectivePrice = (key: string, trade?: string): number => {
     if (trade && delegations[trade]) return delegations[trade].prices[key] ?? 0;
@@ -1223,7 +1298,10 @@ function BidsPanel({
     };
   });
 
-  const directCost = sectionRows.reduce((sum, s) => sum + s.subtotal, 0);
+  const directCost = sectionRows.reduce(
+    (sum, s) => sum + (excludedTrades.has(s.trade) ? 0 : s.subtotal),
+    0,
+  );
   const oh = directCost * (parseFloat(overheadPct) || 0) / 100;
   const profit = directCost * (parseFloat(profitPct) || 0) / 100;
   const contingency = directCost * (parseFloat(contingencyPct) || 0) / 100;
@@ -1238,6 +1316,8 @@ function BidsPanel({
         aiPrices: Object.keys(aiPrices).length > 0 ? aiPrices : undefined,
         aiPricesUpdatedAt: initialBid?.aiPricesUpdatedAt,
         aiPricesZipCode: initialBid?.aiPricesZipCode,
+        delegations: Object.keys(delegations).length > 0 ? delegations : undefined,
+        excludedTrades: excludedTrades.size > 0 ? [...excludedTrades] : undefined,
         overheadPct: parseFloat(overheadPct) || 0,
         profitPct: parseFloat(profitPct) || 0,
         contingencyPct: parseFloat(contingencyPct) || 0,
@@ -1262,6 +1342,20 @@ function BidsPanel({
       setFinalizeError(err instanceof Error ? err.message : 'Finalize failed.');
     } finally {
       setFinalizing(false);
+    }
+  };
+
+  const handleUnfinalize = async () => {
+    setUnfinalizing(true);
+    setUnfinalizeError(null);
+    try {
+      // onSaved clears finalizedAt in the parent's data, which flips `locked` off and
+      // re-enables editing across every tab.
+      const saved = await unfinalizeBid(takeoffId);
+      onSaved(saved);
+    } catch (err) {
+      setUnfinalizeError(err instanceof Error ? err.message : 'Un-finalize failed.');
+      setUnfinalizing(false);
     }
   };
 
@@ -1320,11 +1414,15 @@ function BidsPanel({
         const delegatedSub = section.delegation
           ? subcontractors.find((s) => s.id === section.delegation!.subId)
           : null;
+        const excluded = excludedTrades.has(section.trade);
         return (
-          <div key={`${section.trade}-${i}`} className="mt-5">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-1">
+          <div
+            key={`${section.trade}-${i}`}
+            className={`mt-5 ${excluded ? 'rounded-lg border-l-4 border-rose-400 bg-rose-50/50 py-2 pl-3 pr-2' : ''}`}
+          >
+            <div className={`flex items-center justify-between border-b pb-1 ${excluded ? 'border-rose-200' : 'border-slate-100'}`}>
               <div className="flex items-center gap-2">
-                <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                <h4 className={`text-xs font-semibold uppercase tracking-wide ${excluded ? 'text-rose-400 line-through' : 'text-slate-500'}`}>
                   {section.trade}
                 </h4>
                 {delegatedSub && (
@@ -1332,45 +1430,68 @@ function BidsPanel({
                     {delegatedSub.name}
                   </span>
                 )}
+                {excluded && (
+                  <span className="rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rose-700">
+                    Excluded
+                  </span>
+                )}
               </div>
-              {section.subtotal > 0 && (
-                <span className="text-xs tabular-nums text-slate-400">{fmt(section.subtotal)}</span>
-              )}
+              <div className="flex items-center gap-3">
+                {section.subtotal > 0 && (
+                  <span className={`text-xs tabular-nums ${excluded ? 'text-rose-300 line-through' : 'text-slate-400'}`}>
+                    {fmt(section.subtotal)}
+                  </span>
+                )}
+                {!readOnly && (
+                  <button
+                    type="button"
+                    onClick={() => toggleExcluded(section.trade)}
+                    className={`rounded-md px-2 py-0.5 text-[11px] font-semibold transition-colors ${
+                      excluded
+                        ? 'bg-rose-600 text-white hover:bg-rose-500'
+                        : 'border border-slate-200 text-slate-400 hover:border-rose-300 hover:text-rose-600'
+                    }`}
+                  >
+                    {excluded ? 'Include' : 'Exclude'}
+                  </button>
+                )}
+              </div>
             </div>
 
+            <div className={excluded ? 'opacity-50' : undefined}>
             {section.delegation && !section.delegation.approvedAt ? (
               <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
                 {delegatedSub?.name ?? 'The subcontractor'} has not yet approved their bid.
               </div>
             ) : (
-              <table className="mt-1.5 w-full text-sm">
+              <table className="mt-1.5 w-full table-fixed text-sm">
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs uppercase text-slate-400">
                     <th className="py-1.5 pr-2 font-medium">Item</th>
-                    <th className="py-1.5 pr-2 text-right font-medium">Qty</th>
-                    <th className="py-1.5 pr-2 font-medium">Unit</th>
-                    <th className="py-1.5 pr-2 text-right font-medium">Unit price</th>
-                    <th className="py-1.5 text-right font-medium">Total</th>
+                    <th className="w-16 py-1.5 pr-2 text-right font-medium">Qty</th>
+                    <th className="w-16 py-1.5 pr-2 font-medium">Unit</th>
+                    <th className="w-32 py-1.5 pr-2 text-right font-medium">Unit price</th>
+                    <th className="w-24 py-1.5 text-right font-medium">Total</th>
                   </tr>
                 </thead>
                 <tbody>
                   {section.items.map((item) => (
                     <tr key={item.key} className="border-b border-slate-100 align-middle">
                       <td className="py-1.5 pr-2 text-slate-700">
-                        {item.description}
+                        <AcronymText text={item.description} />
                         {item.notes && (
-                          <span className="block text-xs text-slate-400">{item.notes}</span>
+                          <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                         )}
                       </td>
                       <td className="py-1.5 pr-2 text-right tabular-nums text-slate-600">
                         {item.quantity.toLocaleString()}
                       </td>
-                      <td className="py-1.5 pr-2 text-slate-500">{item.unit}</td>
+                      <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
                       <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
                         {item.unitPrice > 0 ? (
                           <div className="flex items-center justify-end gap-1.5">
                             {item.source === 'ai' && (
-                              <span className="rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">AI</span>
+                              <Tooltip content="Artificial intelligence — AI-estimated price" className="cursor-help rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">AI</Tooltip>
                             )}
                             {item.source === 'override' && (
                               <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Override</span>
@@ -1398,6 +1519,7 @@ function BidsPanel({
                 </tbody>
               </table>
             )}
+            </div>
           </div>
         );
       })}
@@ -1430,18 +1552,32 @@ function BidsPanel({
               Finalized {format(new Date(initialBid.finalizedAt), 'MMM d, yyyy')}
             </span>
           </div>
-          <button
-            type="button"
-            onClick={() => { setShareOpen(true); setShareMode(sharingMode); setShareSuccess(false); setShareError(null); }}
-            className="flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-              <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" strokeLinecap="round" strokeLinejoin="round" />
-              <polyline points="16 6 12 2 8 6" strokeLinecap="round" strokeLinejoin="round" />
-              <line x1="12" y1="2" x2="12" y2="15" strokeLinecap="round" />
-            </svg>
-            Share bid
-          </button>
+          <div className="flex items-center gap-3">
+            {unfinalizeError && <span className="text-xs text-red-600">{unfinalizeError}</span>}
+            {/* A sent bid is permanently locked — un-finalize is only offered beforehand. */}
+            {!initialBid.sentAt && (
+              <button
+                type="button"
+                onClick={handleUnfinalize}
+                disabled={unfinalizing}
+                className="rounded-lg border border-slate-300 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-amber-400 hover:text-amber-700 disabled:cursor-wait disabled:opacity-50"
+              >
+                {unfinalizing ? 'Un-finalizing…' : 'Un-finalize'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => { setShareOpen(true); setShareMode(sharingMode); setShareSuccess(false); setShareError(null); }}
+              className="flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" strokeLinecap="round" strokeLinejoin="round" />
+                <polyline points="16 6 12 2 8 6" strokeLinecap="round" strokeLinejoin="round" />
+                <line x1="12" y1="2" x2="12" y2="15" strokeLinecap="round" />
+              </svg>
+              Share bid
+            </button>
+          </div>
         </div>
       ) : !readOnly && (() => {
         const allApproved = Object.keys(delegations).length === 0 ||
@@ -1481,8 +1617,8 @@ function BidsPanel({
           <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl">
             <h2 className="text-base font-semibold text-slate-900">Finalize this bid?</h2>
             <p className="mt-2 text-sm text-slate-600">
-              Finalizing will lock all fields — the takeoff, materials list, pricing, and bid will
-              become read-only. This cannot be undone.
+              Finalizing locks the takeoff, materials list, pricing, and bid as read-only. You can
+              un-finalize to make changes any time before the bid is sent to the customer.
             </p>
             {finalizeError && (
               <p className="mt-3 text-sm text-red-600">{finalizeError}</p>
@@ -1841,15 +1977,15 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
                   return (
                     <tr key={i} className="border-b border-slate-50 align-middle">
                       <td className="py-1.5 pr-3 text-slate-700">
-                        {item.description}
+                        <AcronymText text={item.description} />
                         {item.notes && (
-                          <span className="block text-xs text-slate-400">{item.notes}</span>
+                          <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                         )}
                       </td>
                       <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
                         {item.quantity.toLocaleString()}
                       </td>
-                      <td className="py-1.5 pr-3 text-slate-500">{item.unit}</td>
+                      <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                       <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
                         {aiPrice != null ? fmt(aiPrice) : '—'}
                       </td>
@@ -1993,15 +2129,15 @@ function SubBidsPanel({ takeoffId, sections, delegations, gaps, onApproved }: Su
               {row.items.map((item) => (
                 <tr key={item.key} className="border-b border-slate-100 align-middle">
                   <td className="py-1.5 pr-2 text-slate-700">
-                    {item.description}
+                    <AcronymText text={item.description} />
                     {item.notes && (
-                      <span className="block text-xs text-slate-400">{item.notes}</span>
+                      <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                     )}
                   </td>
                   <td className="py-1.5 pr-2 text-right tabular-nums text-slate-600">
                     {item.quantity.toLocaleString()}
                   </td>
-                  <td className="py-1.5 pr-2 text-slate-500">{item.unit}</td>
+                  <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
                   <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
                     {item.unitPrice > 0 ? fmt(item.unitPrice) : '—'}
                   </td>
@@ -2112,6 +2248,8 @@ const EMPTY_MATRIX: PricingMatrix = { unitDefaults: {}, tradeOverrides: [] };
 interface TakeoffViewProps {
   takeoff: Takeoff;
   planName: string;
+  /** True when another takeoff for this plan has been finalized — locks this one read-only. */
+  superseded?: boolean;
   pricingMatrix?: PricingMatrix;
   bidSharingMode?: BidSharingMode;
   subcontractors?: Subcontractor[];
@@ -2122,6 +2260,7 @@ interface TakeoffViewProps {
 export function TakeoffView({
   takeoff,
   planName,
+  superseded = false,
   pricingMatrix = EMPTY_MATRIX,
   bidSharingMode = 'full',
   subcontractors = [],
@@ -2139,6 +2278,18 @@ export function TakeoffView({
     : [];
   const isSubView = myDelegatedTrades.length > 0;
   const isFinalized = !!localData.bid?.finalizedAt;
+  // Locked = this takeoff is finalized OR a sibling bid for the project was finalized.
+  const locked = isFinalized || superseded;
+
+  // Canonical units + this takeoff's AI-generated acronyms (the latter win), keyed uppercase.
+  const acronymMap = useMemo(() => {
+    const map: Record<string, string> = { ...UNIT_LABELS };
+    for (const { abbreviation, meaning } of localData.acronyms ?? []) {
+      const key = abbreviation?.trim().toUpperCase();
+      if (key && meaning?.trim()) map[key] = meaning.trim();
+    }
+    return map;
+  }, [localData.acronyms]);
 
   // When in sub view, filter sections to only the delegated trades.
   const subDelegations = localData.bid?.delegations ?? {};
@@ -2228,7 +2379,7 @@ export function TakeoffView({
   };
 
   return (
-    <>
+    <AcronymContext.Provider value={acronymMap}>
       {materialsModalOpen && (
         <MaterialsModal
           trades={availableTrades}
@@ -2271,14 +2422,24 @@ export function TakeoffView({
                   Finalized
                 </span>
               )}
+              {superseded && !isFinalized && (
+                <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-medium text-amber-700">
+                  Superseded
+                </span>
+              )}
             </div>
             <p className="mt-1 text-xs text-slate-400">
               From {planName} · generated by {takeoff.model}
             </p>
+            {superseded && !isFinalized && (
+              <p className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+                Another bid for this project has been finalized — this takeoff is read-only.
+              </p>
+            )}
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
-            {!isSubView && !isFinalized && pending.size > 0 && (
+            {!isSubView && !locked && pending.size > 0 && (
               <UpdateButton
                 count={pending.size}
                 loading={updating}
@@ -2317,9 +2478,9 @@ export function TakeoffView({
         {activeTab === 'takeoff' && (
           <TakeoffPanel
             data={isSubView ? { ...localData, sections: visibleSections, gaps: visibleGaps } : localData}
-            pending={(isSubView || isFinalized) ? new Map() : pending}
+            pending={(isSubView || locked) ? new Map() : pending}
             onVerify={(gap) => setActiveGap(gap)}
-            readOnly={isFinalized}
+            readOnly={locked}
           />
         )}
 
@@ -2334,7 +2495,7 @@ export function TakeoffView({
             <MaterialsPanel
               takeoffId={takeoff.id}
               sections={materialsSections}
-              pending={(isSubView || isFinalized) ? new Map() : pending}
+              pending={(isSubView || locked) ? new Map() : pending}
               updating={updating}
               updateError={updateError}
               onVerify={(gap) => setActiveGap(gap)}
@@ -2344,7 +2505,7 @@ export function TakeoffView({
               onOverridesSaved={(overrides) =>
                 setLocalData((prev) => ({ ...prev, materialsQuantityOverrides: overrides }))
               }
-              readOnly={isSubView || isFinalized}
+              readOnly={isSubView || locked}
             />
           )
         )}
@@ -2372,7 +2533,7 @@ export function TakeoffView({
               subcontractors={subcontractors}
               onSubcontractorAdded={onSubcontractorAdded}
               onSaved={setLocalData}
-              readOnly={isFinalized}
+              readOnly={locked}
             />
           )
         )}
@@ -2404,12 +2565,12 @@ export function TakeoffView({
               pricingMatrix={pricingMatrix}
               subcontractors={subcontractors}
               onSaved={setLocalData}
-              readOnly={isFinalized}
+              readOnly={locked}
               sharingMode={bidSharingMode}
             />
           )
         )}
       </section>
-    </>
+    </AcronymContext.Provider>
   );
 }

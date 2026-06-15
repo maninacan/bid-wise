@@ -8,10 +8,12 @@ interface DelegationData { subId: string; prices: Record<string, number>; approv
 interface BidData {
   prices: Record<string, number>;
   delegations?: Record<string, DelegationData>;
+  excludedTrades?: string[];
   overheadPct: number;
   profitPct: number;
   contingencyPct: number;
   finalizedAt?: string;
+  sentAt?: string;
 }
 export interface BidTakeoffData { projectName: string; sections: TakeoffSection[]; bid?: BidData; }
 
@@ -100,6 +102,9 @@ export async function generateBidPdf(
 
   const bid = data.bid!;
   const delegations = bid.delegations ?? {};
+  const excludedTrades = new Set(bid.excludedTrades ?? []);
+  // Excluded trades are dropped from the proposal entirely.
+  const sections = data.sections.filter((s) => !excludedTrades.has(s.trade));
   let directCost = 0;
 
   const rowLabel = (label: string, value: string, bold = false) => {
@@ -110,7 +115,7 @@ export async function generateBidPdf(
   };
 
   if (sharingMode === 'full') {
-    for (const section of data.sections) {
+    for (const section of sections) {
       checkY(30);
       text(section.trade.toUpperCase(), MARGIN, y, 7.5, true, gray);
       y -= 14;
@@ -162,7 +167,7 @@ export async function generateBidPdf(
       + (bid.contingencyPct || 0) / 100;
     let totalBid = 0;
 
-    for (const section of data.sections) {
+    for (const section of sections) {
       checkY(18);
       const del = delegations[section.trade];
       const sectionDirect = section.items.reduce((sum, item) => {

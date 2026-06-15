@@ -1,12 +1,16 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate, useParams } from 'react-router-dom';
-import type { HousePlan, Takeoff } from '../lib/supabase';
+import { createPopper } from '@popperjs/core';
+import type { HousePlan, Takeoff, TakeoffJob } from '../lib/supabase';
 import {
   archiveTakeoff,
   deleteTakeoff,
+  getActiveTakeoffJob,
   getPlanSignedUrl,
   listTakeoffTokenUsage,
   listTakeoffs,
+  subscribeTakeoffJob,
 } from '../lib/supabase';
 
 interface TakeoffsScreenProps {
@@ -37,8 +41,10 @@ const fmtTokens = (n: number) =>
 function bidTotal(takeoff: Takeoff): number | null {
   const { bid, sections } = takeoff.data;
   if (!bid) return null;
+  const excluded = new Set(bid.excludedTrades ?? []);
   let direct = 0;
   for (const section of sections) {
+    if (excluded.has(section.trade)) continue;
     for (const item of section.items) {
       const key = `${section.trade}::${item.description}`;
       direct += item.quantity * (bid.prices[key] ?? 0);
@@ -59,24 +65,39 @@ interface ActionsMenuProps {
 
 function ActionsMenu({ onArchive, onDelete }: ActionsMenuProps) {
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Position the portaled menu with Popper so it escapes the table's overflow and
+  // flips/shifts to stay within the viewport.
+  useLayoutEffect(() => {
+    if (!open || !triggerRef.current || !menuRef.current) return;
+    const popper = createPopper(triggerRef.current, menuRef.current, {
+      placement: 'bottom-end',
+      modifiers: [
+        { name: 'offset', options: { offset: [0, 4] } },
+        { name: 'flip', options: { padding: 8 } },
+        { name: 'preventOverflow', options: { padding: 8 } },
+      ],
+    });
+    return () => popper.destroy();
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (triggerRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, [open]);
 
   return (
-    <div
-      ref={ref}
-      className="relative flex justify-end"
-      onClick={(e) => e.stopPropagation()}
-    >
+    <div className="flex justify-end" onClick={(e) => e.stopPropagation()}>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="rounded p-1.5 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
@@ -89,8 +110,12 @@ function ActionsMenu({ onArchive, onDelete }: ActionsMenuProps) {
         </svg>
       </button>
 
-      {open && (
-        <div className="absolute right-0 top-full z-20 mt-1 w-36 rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+      {open && createPortal(
+        <div
+          ref={menuRef}
+          className="z-50 w-36 rounded-lg border border-slate-200 bg-white py-1 shadow-lg"
+          onClick={(e) => e.stopPropagation()}
+        >
           <button
             type="button"
             onClick={() => { setOpen(false); onArchive(); }}
@@ -116,7 +141,8 @@ function ActionsMenu({ onArchive, onDelete }: ActionsMenuProps) {
             </svg>
             Delete
           </button>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -170,13 +196,12 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
   const [loading, setLoading] = useState(true);
   const [deleteTarget, setDeleteTarget] = useState<Takeoff | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [activeJob, setActiveJob] = useState<TakeoffJob | null>(null);
 
   const plan = planId ? plans.find((p) => p.id === planId) : null;
 
-  useEffect(() => {
-    if (!planId) return;
-    setLoading(true);
-    listTakeoffs(planId)
+  const loadTakeoffs = (id: string) =>
+    listTakeoffs(id)
       .then((rows) => {
         setTakeoffs(rows);
         if (rows.length > 0) {
@@ -185,8 +210,28 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
             .catch(() => {});
         }
       })
-      .catch(() => {})
-      .finally(() => setLoading(false));
+      .catch(() => {});
+
+  useEffect(() => {
+    if (!planId) return;
+    setLoading(true);
+    loadTakeoffs(planId).finally(() => setLoading(false));
+  }, [planId]);
+
+  // Watch for an in-progress generation: disable "New takeoffs" and surface a banner,
+  // and refresh the list when it finishes.
+  useEffect(() => {
+    if (!planId) return;
+    getActiveTakeoffJob(planId).then(setActiveJob).catch(() => {});
+    const unsubscribe = subscribeTakeoffJob(planId, (job) => {
+      if (job.status === 'running') {
+        setActiveJob(job);
+      } else {
+        setActiveJob(null);
+        if (job.status === 'done') loadTakeoffs(planId);
+      }
+    });
+    return unsubscribe;
   }, [planId]);
 
   useEffect(() => {
@@ -217,6 +262,9 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
     }
   };
 
+  const anyFinalized = takeoffs.some((t) => !!t.data.bid?.finalizedAt);
+  const sentLocked = takeoffs.some((t) => !!t.data.bid?.sentAt);
+
   return (
     <section className="mt-10 w-full">
       {deleteTarget && (
@@ -245,12 +293,35 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
         </h1>
         <button
           type="button"
+          disabled={!!activeJob || sentLocked}
+          title={sentLocked ? 'This project’s bid has been sent — no new takeoffs can be created.' : undefined}
           onClick={() => navigate(`/projects/${planId}/questionnaire`)}
-          className="rounded-lg border-2 border-slate-300 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700"
+          className="rounded-lg border-2 border-slate-300 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700 disabled:cursor-not-allowed disabled:border-slate-200 disabled:text-slate-300 disabled:hover:border-slate-200"
         >
           New takeoffs
         </button>
       </div>
+
+      {sentLocked && (
+        <div className="mt-5 flex items-center gap-2.5 rounded-xl border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden="true" className="shrink-0">
+            <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <span>This project’s bid has been sent to the customer. The project is locked — no new takeoffs can be created.</span>
+        </div>
+      )}
+
+      {activeJob && (
+        <button
+          type="button"
+          onClick={() => navigate(`/projects/${planId}/questionnaire`)}
+          className="mt-5 flex w-full items-center gap-2.5 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-left text-sm text-blue-800 transition-colors hover:bg-blue-100"
+        >
+          <span className="h-2 w-2 animate-pulse rounded-full bg-blue-500" />
+          <span className="font-medium">Generating takeoff…</span>
+          <span className="text-blue-600">View progress →</span>
+        </button>
+      )}
 
       {pdfUrl && (
         <div className="mt-5 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm w-1/2 mx-auto">
@@ -286,6 +357,8 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
               {takeoffs.map((takeoff) => {
                 const total = bidTotal(takeoff);
                 const tokens = tokenUsage[takeoff.id];
+                const isFinalized = !!takeoff.data.bid?.finalizedAt;
+                const superseded = anyFinalized && !isFinalized;
                 return (
                   <tr
                     key={takeoff.id}
@@ -293,7 +366,19 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
                     className="cursor-pointer border-b border-slate-100 transition-colors last:border-0 hover:bg-slate-50"
                   >
                     <td className="px-5 py-3.5 font-medium text-slate-800">
-                      {takeoff.data.projectName}
+                      <div className="flex items-center gap-2">
+                        <span>{takeoff.data.projectName}</span>
+                        {isFinalized && (
+                          <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-medium text-green-700">
+                            Finalized
+                          </span>
+                        )}
+                        {superseded && (
+                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                            Superseded
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="px-5 py-3.5 tabular-nums text-slate-500">
                       {fmtDate(takeoff.created_at)}

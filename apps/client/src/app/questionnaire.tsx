@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { contractorQuestionnaire } from '@bid-wise/data';
-import { generateTakeoff, performTakeoffs, type PricingMatrix, type Takeoff, type TakeoffPhase } from '../lib/supabase';
+import { generateTakeoff, performTakeoffs, cancelTakeoff, cancelAllActiveTakeoffs, getActiveTakeoffJob, getActiveTakeoffJobs, getFinalizedTakeoffForPlan, unfinalizeBid, subscribeTakeoffJob, subscribeUserTakeoffJobs, TakeoffCanceledError, type HousePlan, type PricingMatrix, type Takeoff, type TakeoffPhase, type TakeoffJob } from '../lib/supabase';
 import { TakeoffView } from './takeoff-view';
 
 const { questions, results, start } = contractorQuestionnaire;
@@ -47,7 +47,7 @@ const fmtElapsed = (ms: number) => {
   return `${m}:${String(s).padStart(2, '0')}`;
 };
 
-export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: allowedTrades }: { pricingMatrix?: PricingMatrix; planId?: string; trades?: string[] }) {
+export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, planName, trades: allowedTrades }: { pricingMatrix?: PricingMatrix; planId?: string; planName?: string; trades?: string[] }) {
   const navigate = useNavigate();
   const [currentQuestionId, setCurrentQuestionId] = useState<string | null>(start);
   const [pendingBranches, setPendingBranches] = useState<string[]>([]);
@@ -62,9 +62,18 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
   const [phase, setPhase] = useState<TakeoffPhase | null>(null);
   const [compileTrades, setCompileTrades] = useState<string[]>([]);
   const [elapsedMs, setElapsedMs] = useState(0);
+  const [reattached, setReattached] = useState(false);
+  const [reattachCount, setReattachCount] = useState(0);
+  const [stopping, setStopping] = useState(false);
+  // Set when the user requests cancellation, so the in-flight generateTakeoff rejection
+  // is treated as a clean stop rather than surfaced as a generation error.
+  const cancelingRef = useRef(false);
   const streamRef = useRef<HTMLDivElement>(null);
   const startTimeRef = useRef<number | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // For a reattached (post-refresh) job the clock is anchored to the job's start time.
+  const reattachStartRef = useRef<number | null>(null);
+  const reattachCheckedRef = useRef(false);
 
   useEffect(() => {
     if (streamRef.current) {
@@ -75,8 +84,8 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
   // Elapsed-time clock: runs while a takeoff is generating; cleaned up on finish/unmount.
   useEffect(() => {
     if (passthroughPending) {
-      startTimeRef.current = Date.now();
-      setElapsedMs(0);
+      startTimeRef.current = reattachStartRef.current ?? Date.now();
+      setElapsedMs(Date.now() - startTimeRef.current);
       timerRef.current = setInterval(() => {
         if (startTimeRef.current != null) setElapsedMs(Date.now() - startTimeRef.current);
       }, 1000);
@@ -90,10 +99,78 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
   }, [passthroughPending]);
 
   // Monotonic: a late 'analyzing' (text after compiling) must not regress the stepper.
-  const advancePhase = (next: TakeoffPhase) =>
+  const advancePhase = (next: TakeoffPhase | null) =>
     setPhase((cur) =>
-      PHASE_ORDER.indexOf(next) >= PHASE_ORDER.indexOf(cur ?? next) ? next : cur,
+      next != null && PHASE_ORDER.indexOf(next) >= PHASE_ORDER.indexOf(cur ?? next) ? next : cur,
     );
+
+  // Reattach: if a generation is already running for this plan (e.g. after a page
+  // refresh or in another tab), drive the progress view from the takeoff_jobs row.
+  useEffect(() => {
+    if (!planId || reattachCheckedRef.current) return;
+    reattachCheckedRef.current = true;
+    let unsubscribe: (() => void) | undefined;
+    getActiveTakeoffJob(planId)
+      .then((job) => {
+        if (!job) return;
+        reattachStartRef.current = new Date(job.created_at).getTime();
+        setReattached(true);
+        setPhase(job.phase);
+        setCompileTrades(job.trades ?? []);
+        setStreamingText(job.narration ?? '');
+        setPassthroughPending(true);
+        unsubscribe = subscribeTakeoffJob(planId, (next: TakeoffJob) => {
+          if (next.status === 'running') {
+            advancePhase(next.phase);
+            setCompileTrades(next.trades ?? []);
+            setStreamingText(next.narration ?? '');
+          } else if (next.status === 'done') {
+            navigate(
+              next.takeoff_id
+                ? `/projects/${planId}/takeoffs/${next.takeoff_id}`
+                : `/projects/${planId}`,
+            );
+          } else if (next.status === 'error') {
+            setPassthroughError(next.error ?? 'Takeoff generation failed.');
+            setPassthroughPending(false);
+            setReattached(false);
+          } else if (next.status === 'canceled') {
+            setPassthroughPending(false);
+            setReattached(false);
+            setStopping(false);
+            cancelingRef.current = false;
+          }
+        });
+      })
+      .catch(() => { /* no active job / not reattaching */ });
+    return () => unsubscribe?.();
+  }, [planId, navigate]);
+
+  // Reattach for the multi-plan flow (no specific plan): if any generation is running
+  // for the user, show aggregate progress and send them to /projects when all finish.
+  useEffect(() => {
+    if (planId || reattachCheckedRef.current) return;
+    reattachCheckedRef.current = true;
+    let unsubscribe: (() => void) | undefined;
+    getActiveTakeoffJobs()
+      .then((jobs) => {
+        if (jobs.length === 0) return;
+        const running = new Set(jobs.map((j) => j.id));
+        reattachStartRef.current = Math.min(...jobs.map((j) => new Date(j.created_at).getTime()));
+        setReattached(true);
+        setReattachCount(running.size);
+        setCompileTrades([...new Set(jobs.flatMap((j) => j.trades ?? []))]);
+        setPassthroughPending(true);
+        unsubscribe = subscribeUserTakeoffJobs((next: TakeoffJob) => {
+          if (next.status === 'running') running.add(next.id);
+          else running.delete(next.id);
+          setReattachCount(running.size);
+          if (running.size === 0) navigate('/projects');
+        });
+      })
+      .catch(() => { /* no active jobs / not reattaching */ });
+    return () => unsubscribe?.();
+  }, [planId, navigate]);
 
   const passthroughActions: Record<string, (selections: string[]) => Promise<unknown>> = {
     takeoffs: planId
@@ -105,6 +182,8 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
   };
 
   const question = currentQuestionId ? questions[currentQuestionId] : null;
+  // Multi-plan (no specific plan) reattach: aggregate progress, no per-phase stepper.
+  const genericReattach = reattached && !planId;
 
   const toggleChoice = (value: string) => {
     setPassthroughError(null);
@@ -163,24 +242,34 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
         setStreamingText('');
         setPhase(null);
         setCompileTrades([]);
+        setReattached(false);
+        setReattachCount(0);
+        reattachStartRef.current = null; // live run: clock anchors to now
+        cancelingRef.current = false; // fresh run: clear any prior cancellation guard
+        setStopping(false);
         setPassthroughPending(true);
         setPassthroughError(null);
         try {
           const result = await action(chosen.map((c) => c.value));
           if (Array.isArray(result) && result.length > 0) {
             if (planId) {
-              navigate(`/projects/${planId}`);
+              navigate(`/projects/${planId}/takeoffs/${(result[0] as Takeoff).id}`);
               return;
             }
             setTakeoffs(result as Takeoff[]);
           }
         } catch (err) {
-          setPassthroughError(
-            err instanceof Error ? err.message : 'Takeoff generation failed.',
-          );
+          // A user-initiated cancellation isn't an error — leave the message clear.
+          if (!(err instanceof TakeoffCanceledError) && !cancelingRef.current) {
+            setPassthroughError(
+              err instanceof Error ? err.message : 'Takeoff generation failed.',
+            );
+          }
           return;
         } finally {
           setPassthroughPending(false);
+          setStopping(false);
+          cancelingRef.current = false;
         }
       }
     }
@@ -202,6 +291,31 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
     setPendingBranches(remaining);
     setSelected(new Set());
     setCurrentQuestionId(nextQuestionId);
+  };
+
+  // Stop an in-progress generation. Asks the server to cancel, then returns to the
+  // questionnaire immediately rather than waiting on the in-flight stream to unwind —
+  // that can lag by a few seconds. cancelingRef stays set so the eventual stream
+  // rejection (TakeoffCanceledError) is swallowed instead of shown as an error; it's
+  // cleared when the next generation starts (and by handleNext's finally for live runs).
+  const handleStop = async () => {
+    if (stopping) return;
+    setStopping(true);
+    cancelingRef.current = true;
+    try {
+      if (planId) await cancelTakeoff(planId);
+      else await cancelAllActiveTakeoffs();
+    } catch {
+      // Best-effort: the run may have already finished. Tear the view down regardless.
+    } finally {
+      setPassthroughPending(false);
+      setStopping(false);
+      setReattached(false);
+      setReattachCount(0);
+      setStreamingText('');
+      setPhase(null);
+      setCompileTrades([]);
+    }
   };
 
   const handleBack = () => {
@@ -227,7 +341,10 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
     setPhase(null);
     setCompileTrades([]);
     setElapsedMs(0);
+    setReattached(false);
+    setReattachCount(0);
     startTimeRef.current = null;
+    reattachStartRef.current = null;
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch {
@@ -238,6 +355,24 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
   if (question) {
     return (
       <>
+        {planId && (
+          <button
+            type="button"
+            onClick={() => navigate(`/projects/${planId}`)}
+            className="mb-5 flex items-center gap-1.5 self-start text-sm font-medium text-slate-500 transition-colors hover:text-slate-800"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+            </svg>
+            Back to project
+          </button>
+        )}
+        {planName && (
+          <h1 className="self-start text-left text-xl font-semibold text-slate-800">{planName}</h1>
+        )}
+        {/* Hide the question + trade buttons once generation starts so the output is top and center. */}
+        {!passthroughPending && (
+        <>
         <h1 className="mt-10 text-center text-xl font-semibold text-slate-800">
           {question.text}
         </h1>
@@ -278,6 +413,8 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
             );
           })}
         </div>
+        </>
+        )}
 
         {passthroughError && (
           <p className="mt-6 text-sm text-red-600">{passthroughError}</p>
@@ -298,12 +435,22 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
               <div className="flex items-center gap-3">
                 <span className="font-mono text-xs tabular-nums text-slate-400">{fmtElapsed(elapsedMs)}</span>
                 <div className="flex items-center gap-1.5">
-                  <span className="h-2 w-2 animate-pulse rounded-full bg-green-400" />
-                  <span className="text-xs text-green-400">live</span>
+                  <span className={`h-2 w-2 rounded-full ${stopping ? 'bg-amber-400' : 'animate-pulse bg-green-400'}`} />
+                  <span className={`text-xs ${stopping ? 'text-amber-400' : 'text-green-400'}`}>{stopping ? 'stopping' : 'live'}</span>
                 </div>
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  disabled={stopping}
+                  className="flex items-center gap-1.5 rounded-md border border-slate-700 px-2.5 py-1 font-mono text-xs text-slate-300 transition-colors hover:border-red-500/60 hover:bg-red-500/10 hover:text-red-300 disabled:cursor-wait disabled:opacity-60"
+                >
+                  <span className="h-2 w-2 rounded-sm bg-red-400" />
+                  {stopping ? 'Stopping…' : 'Stop'}
+                </button>
               </div>
             </div>
-            {/* Phase stepper */}
+            {/* Phase stepper (per-plan only; the multi-plan reattach has no single phase) */}
+            {!genericReattach && (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 border-b border-slate-800 px-4 py-2.5">
               {PHASE_STEPS.map((step) => {
                 const stepIdx = PHASE_ORDER.indexOf(step.phase);
@@ -328,6 +475,7 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
                 );
               })}
             </div>
+            )}
             {/* Advisory */}
             <div className="flex items-center gap-2 border-b border-slate-800 px-4 py-2 text-xs text-amber-300/90">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true" className="shrink-0">
@@ -341,9 +489,11 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
               ref={streamRef}
               className="h-72 overflow-y-auto p-4 font-mono text-xs leading-relaxed text-green-300"
             >
-              {streamingText
-                ? <span className="whitespace-pre-wrap">{streamingText}</span>
-                : <span className="text-slate-500">Initializing…</span>
+              {genericReattach
+                ? <span className="text-slate-500">Resuming… generating {reattachCount} takeoff{reattachCount === 1 ? '' : 's'}. You’ll be taken to your projects when complete.</span>
+                : streamingText
+                  ? <span className="whitespace-pre-wrap">{streamingText}</span>
+                  : <span className="text-slate-500">{reattached ? 'Resuming…' : 'Initializing…'}</span>
               }
               {phase === 'compiling' && (
                 <p className="mt-3 text-green-300">
@@ -465,7 +615,138 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, trades: al
   );
 }
 
-export function QuestionnaireForPlan({ pricingMatrix, trades }: { pricingMatrix?: PricingMatrix; trades?: string[] }) {
+/** Blocks the questionnaire when the project's bid is finalized or sent, and offers an
+ *  un-finalize path (finalized only — a sent bid is permanently locked). */
+function FinalizedNotice({
+  planId,
+  planName,
+  sent,
+  takeoffId,
+  onReopened,
+}: {
+  planId: string;
+  planName?: string;
+  sent: boolean;
+  takeoffId?: string;
+  onReopened: () => void;
+}) {
+  const navigate = useNavigate();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleUnfinalize = async () => {
+    if (!takeoffId) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await unfinalizeBid(takeoffId);
+      onReopened();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not un-finalize the bid.');
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="mt-10 w-full max-w-xl">
+      <button
+        type="button"
+        onClick={() => navigate(`/projects/${planId}`)}
+        className="mb-5 flex items-center gap-1.5 text-sm font-medium text-slate-500 transition-colors hover:text-slate-800"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+        </svg>
+        Back to project
+      </button>
+
+      <div className="rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
+        <div className={`mx-auto flex h-12 w-12 items-center justify-center rounded-full ${sent ? 'bg-green-100 text-green-600' : 'bg-amber-100 text-amber-600'}`}>
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <rect x="5" y="11" width="14" height="10" rx="2" />
+            <path d="M8 11V7a4 4 0 0 1 8 0v4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </div>
+        <h1 className="mt-4 text-lg font-semibold text-slate-900">
+          {planName ? `${planName} is ${sent ? 'sent' : 'finalized'}` : `This project is ${sent ? 'sent' : 'finalized'}`}
+        </h1>
+        <p className="mx-auto mt-2 max-w-sm text-sm text-slate-500">
+          {sent
+            ? 'This bid has been sent to the customer, so the project is locked. No new takeoffs can be created.'
+            : 'This project’s bid is finalized and locked. To create new takeoffs or change the bid, un-finalize it first.'}
+        </p>
+
+        {error && <p className="mt-4 text-sm text-red-600">{error}</p>}
+
+        <div className="mt-6 flex items-center justify-center gap-3">
+          <button
+            type="button"
+            onClick={() => navigate(`/projects/${planId}`)}
+            className="rounded-lg border-2 border-slate-300 bg-white px-5 py-2.5 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700"
+          >
+            Back to project
+          </button>
+          {!sent && (
+            <button
+              type="button"
+              onClick={handleUnfinalize}
+              disabled={busy || !takeoffId}
+              className="rounded-lg bg-amber-600 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-amber-500 disabled:cursor-wait disabled:bg-slate-300"
+            >
+              {busy ? 'Un-finalizing…' : 'Un-finalize bid'}
+            </button>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+type LockState =
+  | { status: 'loading' | 'open' }
+  | { status: 'finalized' | 'sent'; takeoffId: string };
+
+export function QuestionnaireForPlan({ plans = [], pricingMatrix, trades }: { plans?: HousePlan[]; pricingMatrix?: PricingMatrix; trades?: string[] }) {
   const { planId } = useParams<{ planId: string }>();
-  return <Questionnaire pricingMatrix={pricingMatrix} planId={planId} trades={trades} />;
+  const plan = plans.find((p) => p.id === planId);
+  const planName = plan ? plan.file_name.replace(/\.[^.]+$/, '') : undefined;
+
+  // A finalized (or sent) bid locks the project from new takeoffs — gate on it before
+  // rendering the questionnaire.
+  const [lock, setLock] = useState<LockState>({ status: 'loading' });
+
+  useEffect(() => {
+    if (!planId) {
+      setLock({ status: 'open' });
+      return;
+    }
+    let active = true;
+    setLock({ status: 'loading' });
+    getFinalizedTakeoffForPlan(planId)
+      .then((t) => {
+        if (!active) return;
+        if (!t) setLock({ status: 'open' });
+        else setLock({ status: t.data.bid?.sentAt ? 'sent' : 'finalized', takeoffId: t.id });
+      })
+      .catch(() => active && setLock({ status: 'open' }));
+    return () => {
+      active = false;
+    };
+  }, [planId]);
+
+  if (lock.status === 'loading') {
+    return <p className="mt-10 text-center text-sm text-slate-500">Loading…</p>;
+  }
+  if (lock.status === 'finalized' || lock.status === 'sent') {
+    return (
+      <FinalizedNotice
+        planId={planId!}
+        planName={planName}
+        sent={lock.status === 'sent'}
+        takeoffId={lock.takeoffId}
+        onReopened={() => setLock({ status: 'open' })}
+      />
+    );
+  }
+  return <Questionnaire pricingMatrix={pricingMatrix} planId={planId} planName={planName} trades={trades} />;
 }

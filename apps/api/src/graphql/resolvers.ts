@@ -420,6 +420,12 @@ async function shareBidPdf(
 
   if (errors.length > 0) throw new GraphQLError(errors.join(' '));
 
+  // Record that the bid was sent to the customer. This locks the project from new takeoffs.
+  if (data.bid) {
+    data.bid.sentAt = new Date().toISOString();
+    await ctx.supabase.from('takeoffs').update({ data }).eq('id', takeoffId);
+  }
+
   return { ok: true };
 }
 
