@@ -12,7 +12,7 @@
     "deploy:client": "fly deploy --config fly-client.toml --dockerfile client.Dockerfile",
     "deploy:marketing": "fly deploy --config fly-marketing.toml --dockerfile marketing.Dockerfile",
     "deploy:sap": "fly deploy --config fly-super-admin-portal.toml --dockerfile super-admin-portal.Dockerfile",
-    "secrets:api": "doppler run --project bid-wise --config dev_personal -- sh -c 'fly secrets set -a bidwise-api SUPABASE_URL=\"$VITE_SUPABASE_URL\" SUPABASE_SERVICE_ROLE_KEY=\"$SUPABASE_SERVICE_ROLE_KEY\" ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" RESEND_API_KEY=\"$RESEND_API_KEY\" RESEND_FROM_EMAIL=\"$RESEND_FROM_EMAIL\" STRIPE_SECRET_KEY=\"$STRIPE_SECRET_KEY\" STRIPE_WEBHOOK_SECRET=\"$STRIPE_WEBHOOK_SECRET\" CORS_ALLOWED_ORIGINS=\"https://bidwise.fly.dev,https://bidwise-super-admin-portal.fly.dev\" APP_URL=\"https://bidwise.fly.dev\"'"
+    "secrets:api": "doppler run --project bid-wise --config dev_personal -- sh -c 'fly secrets set -a bidwise-api SUPABASE_URL=\"$VITE_SUPABASE_URL\" SUPABASE_SERVICE_ROLE_KEY=\"$SUPABASE_SERVICE_ROLE_KEY\" ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" RESEND_API_KEY=\"$RESEND_API_KEY\" RESEND_FROM_EMAIL=\"$RESEND_FROM_EMAIL\" STRIPE_SECRET_KEY=\"$STRIPE_SECRET_KEY\" STRIPE_WEBHOOK_SECRET=\"$STRIPE_WEBHOOK_SECRET\" CORS_ALLOWED_ORIGINS=\"https://app.bidwise.builders,https://super-admin.bidwise.builders\" APP_URL=\"https://app.bidwise.builders\"'"
   },
   "private": true,
   "devDependencies": {
