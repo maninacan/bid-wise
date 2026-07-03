@@ -1,5 +1,7 @@
 # syntax = docker/dockerfile:1
-ARG NODE_VERSION=20
+# Node 22+ required: @supabase/supabase-js (realtime-js) needs native WebSocket,
+# which Node 20 lacks — the API crashes on boot otherwise.
+ARG NODE_VERSION=22
 
 ########## build ##########
 FROM node:${NODE_VERSION}-slim AS build

@@ -1,5 +1,6 @@
-# First stage: build the Astro static site
-FROM node:20-slim AS builder
+# First stage: build the Astro static site.
+# Astro 6 requires Node >=22 (Node 20 is rejected at build time).
+FROM node:22-slim AS builder
 WORKDIR /app
 
 ENV CI=true

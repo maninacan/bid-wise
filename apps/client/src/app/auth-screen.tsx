@@ -7,7 +7,14 @@ interface AuthScreenProps {
 }
 
 export function AuthScreen({ hasAnonymousData }: AuthScreenProps) {
-  const [tab, setTab] = useState<'signin' | 'signup'>('signin');
+  // Allow deep-linking straight to the signup tab (e.g. from the marketing
+  // site: app.bidwise.builders/?mode=signup).
+  const [tab, setTab] = useState<'signin' | 'signup'>(() =>
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('mode') === 'signup'
+      ? 'signup'
+      : 'signin'
+  );
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
