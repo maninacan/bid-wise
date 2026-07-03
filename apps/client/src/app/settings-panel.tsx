@@ -1,24 +1,7 @@
 import { useState } from 'react';
+import { TRADES } from '@bid-wise/data';
 import type { BidSharingMode, UserSettings } from '../lib/supabase';
 import { saveSettings } from '../lib/supabase';
-
-export const TRADES: { value: string; label: string }[] = [
-  { value: 'gc',          label: 'General Contractor' },
-  { value: 'concrete',    label: 'Concrete / Masonry' },
-  { value: 'framing',     label: 'Framing / Carpentry' },
-  { value: 'roofing',     label: 'Roofing' },
-  { value: 'drywall',     label: 'Drywall / Plastering' },
-  { value: 'painting',    label: 'Painting / Coatings' },
-  { value: 'electrical',  label: 'Electrical' },
-  { value: 'plumbing',    label: 'Plumbing' },
-  { value: 'hvac',        label: 'HVAC / Mechanical' },
-  { value: 'flooring',    label: 'Flooring' },
-  { value: 'tile',        label: 'Tile / Stone' },
-  { value: 'cabinetry',   label: 'Cabinetry' },
-  { value: 'appliances',  label: 'Appliances' },
-  { value: 'finish-work', label: 'Finish Work' },
-  { value: 'landscape',   label: 'Landscaping / Hardscaping' },
-];
 
 interface TradesSelectorGridProps {
   selected: Set<string>;

@@ -8,6 +8,7 @@ import { resolvers } from './graphql/resolvers';
 import type { GqlContext } from './graphql/context';
 import { createGraphqlRouter } from './routes/graphql.route';
 import { takeoffRouter, cancelTakeoffRouter } from './routes/takeoff.route';
+import { stripeWebhookHandler } from './stripe-webhook';
 
 async function startServer() {
   const app = express();
@@ -20,6 +21,11 @@ async function startServer() {
   });
 
   await server.start();
+
+  // Stripe webhook — must see the RAW request body for signature verification, so it's
+  // mounted with express.raw() before any JSON parser. It's a server-to-server call
+  // (no browser), so it sits outside CORS.
+  app.post('/webhook/stripe', express.raw({ type: 'application/json' }), stripeWebhookHandler);
 
   // Allowed browser origins. Defaults to the local client; override in prod via
   // CORS_ALLOWED_ORIGINS (comma-separated), e.g. "https://app.bidwise.com".
@@ -34,11 +40,17 @@ async function startServer() {
   app.use('/generate-takeoff', takeoffRouter);
   app.use('/cancel-takeoff', cancelTakeoffRouter);
 
-  const host = process.env.HOST ?? 'localhost';
+  // Bind a specific host only when explicitly set (e.g. prod behind a proxy). Otherwise
+  // omit it so Node listens dual-stack on all interfaces — reachable via both 127.0.0.1
+  // and ::1. Binding the literal 'localhost' resolves to a single stack (often ::1 only),
+  // which makes the browser's IPv4 localhost requests fail with ERR_CONNECTION_REFUSED.
+  const host = process.env.HOST;
   const port = process.env.PORT ? Number(process.env.PORT) : 4000;
 
-  await new Promise<void>((resolve) => httpServer.listen({ port, host }, resolve));
-  console.log(`Server ready at http://${host}:${port}/graphql`);
+  await new Promise<void>((resolve) =>
+    host ? httpServer.listen({ port, host }, resolve) : httpServer.listen(port, resolve),
+  );
+  console.log(`Server ready at http://localhost:${port}/graphql`);
 }
 
 startServer();

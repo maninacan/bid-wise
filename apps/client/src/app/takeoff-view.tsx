@@ -1,20 +1,25 @@
-import { createContext, useContext, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { format } from 'date-fns';
 import { Tooltip } from '@bid-wise/common-components';
 import type {
   BidData,
   BidSharingMode,
+  CustomLineItem,
   DelegationData,
+  PriceParts,
+  PriceValue,
   PricingMatrix,
   Subcontractor,
+  SubDelegationUpdate,
   Takeoff,
   TakeoffData,
   TakeoffGap,
   TakeoffItem,
   TakeoffSection,
 } from '../lib/supabase';
-import { approveSubBid, clarifyTakeoff, finalizeBid, getLocalPricing, saveBid, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid } from '../lib/supabase';
+import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, priceParts, priceTotal, saveBid, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
+import { notifyCreditsChanged } from './billing-screen';
 import { SubcontractorFormModal } from './subs-screen';
 
 /** Normalize legacy string gaps from old takeoffs to the structured format. */
@@ -476,6 +481,23 @@ function MaterialsPanel({
       )
     : 0;
 
+  // Save action mirrored at the top and bottom of the panel for convenience.
+  const saveRow = !readOnly && (
+    <div className="mt-6 flex items-center justify-end gap-3">
+      {savedAt && (
+        <span className="text-xs text-slate-400">Saved {format(savedAt, 'h:mm a')}</span>
+      )}
+      <button
+        type="button"
+        onClick={handleSaveOverrides}
+        disabled={saving}
+        className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:bg-slate-300"
+      >
+        {saving ? 'Saving…' : 'Save overrides'}
+      </button>
+    </div>
+  );
+
   return (
     <div className="mt-4">
       {unverifiedCount > 0 && (
@@ -503,6 +525,8 @@ function MaterialsPanel({
           />
         )}
       </div>
+
+      {saveRow}
 
       {sections.map((section, i) => (
         <div key={`${section.trade}-${i}`} className="mt-5">
@@ -605,23 +629,7 @@ function MaterialsPanel({
         </div>
       ))}
 
-      {!readOnly && (
-        <div className="mt-6 flex items-center justify-end gap-3">
-          {savedAt && (
-            <span className="text-xs text-slate-400">
-              Saved {format(savedAt, 'h:mm a')}
-            </span>
-          )}
-          <button
-            type="button"
-            onClick={handleSaveOverrides}
-            disabled={saving}
-            className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:bg-slate-300"
-          >
-            {saving ? 'Saving…' : 'Save overrides'}
-          </button>
-        </div>
-      )}
+      {saveRow}
     </div>
   );
 }
@@ -632,6 +640,57 @@ const fmt = (n: number) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
 
 const bidKey = (trade: string, description: string) => `${trade}::${description}`;
+
+type MergedItem = TakeoffItem & { isCustom?: boolean };
+interface MergedSection { trade: string; items: MergedItem[] }
+
+/** Merges user-added custom items into the AI takeoff sections — appended to a matching
+ *  trade, or as a new trade — flagging each so the UI can distinguish them. The AI
+ *  `sections` are never mutated, so the original is always recoverable. */
+function mergeSections(sections: TakeoffSection[], customItems: CustomLineItem[] = []): MergedSection[] {
+  const merged: MergedSection[] = sections.map((s) => ({ trade: s.trade, items: s.items.map((it) => ({ ...it })) }));
+  const byTrade = new Map(merged.map((s) => [s.trade, s]));
+  for (const ci of customItems) {
+    const item: MergedItem = { description: ci.description, quantity: ci.quantity, unit: ci.unit, source: 'estimated', isCustom: true };
+    const existing = byTrade.get(ci.trade);
+    if (existing) existing.items.push(item);
+    else {
+      const ns: MergedSection = { trade: ci.trade, items: [item] };
+      merged.push(ns);
+      byTrade.set(ci.trade, ns);
+    }
+  }
+  return merged;
+}
+
+/** mm:ss from milliseconds. */
+const fmtClock = (ms: number) => {
+  const total = Math.floor(ms / 1000);
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+};
+
+/** Compact token count, e.g. 14.2K / 1.5M. */
+const fmtTokens = (n: number) =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}K` : String(n);
+
+/** Elapsed-time stopwatch (ms) that runs while `running` is true; resets on each start. */
+function useStopwatch(running: boolean): number {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!running) {
+      startRef.current = null;
+      return;
+    }
+    startRef.current = Date.now();
+    setElapsed(0);
+    const id = setInterval(() => {
+      if (startRef.current != null) setElapsed(Date.now() - startRef.current);
+    }, 250);
+    return () => clearInterval(id);
+  }, [running]);
+  return elapsed;
+}
 
 // ── Delegate modal ────────────────────────────────────────────────────────────
 
@@ -745,20 +804,24 @@ interface PricingPanelProps {
 }
 
 function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubcontractorAdded, onSaved, readOnly = false }: PricingPanelProps) {
-  const [aiPrices, setAiPrices] = useState<Record<string, number>>(
-    initialBid?.aiPrices ?? {},
-  );
+  const [aiPrices, setAiPrices] = useState<Record<string, PriceParts>>(() => {
+    const out: Record<string, PriceParts> = {};
+    for (const [k, v] of Object.entries(initialBid?.aiPrices ?? {})) out[k] = priceParts(v);
+    return out;
+  });
 
-  const [manualPrices, setManualPrices] = useState<Record<string, string>>(() => {
+  // Per-component manual overrides ('' = not overridden, falls back to the AI value).
+  const [manualPrices, setManualPrices] = useState<Record<string, { material: string; labor: string }>>(() => {
     const savedAi = initialBid?.aiPrices ?? {};
-    return Object.fromEntries(
-      Object.entries(initialBid?.prices ?? {})
-        .filter(([k, v]) => {
-          const ai = savedAi[k];
-          return ai === undefined || v !== ai;
-        })
-        .map(([k, v]) => [k, String(v)]),
-    );
+    const out: Record<string, { material: string; labor: string }> = {};
+    for (const [k, v] of Object.entries(initialBid?.prices ?? {})) {
+      const saved = priceParts(v);
+      const ai = priceParts(savedAi[k]);
+      const material = saved.material !== ai.material ? String(saved.material) : '';
+      const labor = saved.labor !== ai.labor ? String(saved.labor) : '';
+      if (material !== '' || labor !== '') out[k] = { material, labor };
+    }
+    return out;
   });
 
   const [aiPricesUpdatedAt, setAiPricesUpdatedAt] = useState<Date | null>(
@@ -773,6 +836,9 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiFilled, setAiFilled] = useState<number | null>(null);
+  const [aiTokens, setAiTokens] = useState<number | null>(null);
+  const [aiDurationMs, setAiDurationMs] = useState<number | null>(null);
+  const aiElapsedMs = useStopwatch(aiLoading);
   const [delegations, setDelegations] = useState<Record<string, DelegationData>>(
     initialBid?.delegations ?? {},
   );
@@ -783,22 +849,236 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
 
-  const effectiveUnitPrice = (key: string, trade?: string): number => {
-    if (trade && delegations[trade]) return delegations[trade].prices[key] ?? 0;
-    const manual = manualPrices[key];
-    if (manual && parseFloat(manual) > 0) return parseFloat(manual);
-    return aiPrices[key] ?? 0;
+  // Line items struck out here are dropped from totals and hidden from the Bid tab / PDF.
+  const [excludedItems, setExcludedItems] = useState<Set<string>>(
+    () => new Set(initialBid?.excludedItems ?? []),
+  );
+  const toggleExcludedItem = (key: string) =>
+    setExcludedItems((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
+  // User-added line items, kept separate from the AI takeoff so the original is preserved.
+  const [customItems, setCustomItems] = useState<CustomLineItem[]>(initialBid?.customItems ?? []);
+  const renderSections = useMemo(() => mergeSections(sections, customItems), [sections, customItems]);
+
+  const removeCustomItem = (trade: string, description: string) =>
+    setCustomItems((prev) => prev.filter((c) => !(c.trade === trade && c.description === description)));
+
+  // ── Add-line-item drafts ──
+  // `addItemTrade` = the existing trade whose inline "add item" form is open (null = none);
+  // `newTradeOpen` = the "add a new trade" form at the bottom is open. Only one at a time.
+  const [addItemTrade, setAddItemTrade] = useState<string | null>(null);
+  const [newTradeOpen, setNewTradeOpen] = useState(false);
+  const [draftTradeName, setDraftTradeName] = useState('');
+  const [draftDesc, setDraftDesc] = useState('');
+  const [draftUnit, setDraftUnit] = useState('EA');
+  const [draftQty, setDraftQty] = useState('1');
+  const [draftError, setDraftError] = useState<string | null>(null);
+
+  const resetDraft = () => {
+    setDraftTradeName('');
+    setDraftDesc('');
+    setDraftUnit('EA');
+    setDraftQty('1');
+    setDraftError(null);
   };
+  const openItemForm = (trade: string) => { setAddItemTrade(trade); setNewTradeOpen(false); resetDraft(); };
+  const openNewTradeForm = () => { setNewTradeOpen(true); setAddItemTrade(null); resetDraft(); };
+  const closeAddForms = () => { setAddItemTrade(null); setNewTradeOpen(false); setDraftError(null); };
+
+  // Validates the shared draft fields and appends a custom item to `trade`.
+  const commitCustomItem = (trade: string) => {
+    const description = draftDesc.trim();
+    const quantity = parseFloat(draftQty);
+    const unit = draftUnit.trim() || 'EA';
+    if (!trade.trim()) return setDraftError('Enter a trade name.');
+    if (!description) return setDraftError('Enter a description.');
+    if (!(quantity > 0)) return setDraftError('Enter a quantity greater than 0.');
+    const exists =
+      customItems.some((c) => c.trade === trade && c.description === description) ||
+      sections.some((s) => s.trade === trade && s.items.some((it) => it.description === description));
+    if (exists) return setDraftError('That trade already has an item with this description.');
+    setCustomItems((prev) => [...prev, { trade: trade.trim(), description, unit, quantity }]);
+    closeAddForms();
+  };
+
+  // Inline add form, shared by the per-trade "add item" and the bottom "add trade" flows.
+  const addItemForm = (onSubmit: () => void, withTradeName: boolean) => (
+    <div className="mt-2 rounded-lg border border-indigo-200 bg-indigo-50/50 p-3">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+        {withTradeName && (
+          <div className="sm:col-span-3">
+            <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Trade</label>
+            <input
+              type="text"
+              value={draftTradeName}
+              onChange={(e) => setDraftTradeName(e.target.value)}
+              placeholder="New trade name"
+              autoFocus
+              className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+            />
+          </div>
+        )}
+        <div className={withTradeName ? 'sm:col-span-5' : 'sm:col-span-8'}>
+          <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Description</label>
+          <input
+            type="text"
+            value={draftDesc}
+            onChange={(e) => setDraftDesc(e.target.value)}
+            placeholder="e.g. Permit fees"
+            autoFocus={!withTradeName}
+            onKeyDown={(e) => e.key === 'Enter' && onSubmit()}
+            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+          />
+        </div>
+        <div className="sm:col-span-2">
+          <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Qty</label>
+          <input
+            type="number"
+            min={0}
+            step="any"
+            value={draftQty}
+            onChange={(e) => setDraftQty(e.target.value)}
+            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-right text-sm tabular-nums text-slate-700 focus:border-indigo-400 focus:outline-none"
+          />
+        </div>
+        <div className="sm:col-span-2">
+          <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Unit</label>
+          <input
+            type="text"
+            value={draftUnit}
+            onChange={(e) => setDraftUnit(e.target.value)}
+            placeholder="EA"
+            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+          />
+        </div>
+      </div>
+      {draftError && <p className="mt-2 text-xs text-red-600">{draftError}</p>}
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <button
+          type="button"
+          onClick={closeAddForms}
+          className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-white"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onSubmit}
+          className="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-indigo-500"
+        >
+          Add item
+        </button>
+      </div>
+    </div>
+  );
+
+  // Effective material+labor parts: delegated sub quote → per-component manual override → AI.
+  const effectiveParts = (key: string, trade?: string): PriceParts => {
+    if (trade && delegations[trade]) return priceParts(delegations[trade].prices[key]);
+    const ai = aiPrices[key] ?? { material: 0, labor: 0 };
+    const mp = manualPrices[key];
+    return {
+      material: mp?.material ? parseFloat(mp.material) || 0 : ai.material,
+      labor: mp?.labor ? parseFloat(mp.labor) || 0 : ai.labor,
+    };
+  };
+  const effectiveUnitPrice = (key: string, trade?: string): number => {
+    const p = effectiveParts(key, trade);
+    return p.material + p.labor;
+  };
+
+  const setManualComponent = (key: string, field: 'material' | 'labor', val: string) =>
+    setManualPrices((prev) => {
+      const cur = prev[key] ?? { material: '', labor: '' };
+      return { ...prev, [key]: { ...cur, [field]: val } };
+    });
+
+  const setDelegationComponent = (trade: string, key: string, field: 'material' | 'labor', val: string) =>
+    setDelegations((prev) => {
+      const cur = priceParts(prev[trade].prices[key]);
+      return {
+        ...prev,
+        [trade]: {
+          ...prev[trade],
+          prices: { ...prev[trade].prices, [key]: { ...cur, [field]: parseFloat(val) || 0 } },
+        },
+      };
+    });
+
+  // Read-only AI material/labor cell.
+  const aiCell = (ai: PriceParts | undefined) =>
+    ai ? (
+      <div className="text-right text-xs leading-tight tabular-nums">
+        <div className="text-slate-500">M {fmt(ai.material)}</div>
+        <div className="text-slate-400">L {fmt(ai.labor)}</div>
+      </div>
+    ) : (
+      <span className="text-slate-400">—</span>
+    );
+
+  // Side-by-side material/labor number inputs.
+  const priceInputs = (
+    matVal: string,
+    labVal: string,
+    matPh: string,
+    labPh: string,
+    onMat: (v: string) => void,
+    onLab: (v: string) => void,
+    accent: string,
+  ) => (
+    <div className="flex items-center justify-end gap-1.5">
+      {([['M', matVal, matPh, onMat], ['L', labVal, labPh, onLab]] as const).map(([lbl, val, ph, on]) => (
+        <div key={lbl} className="flex items-center gap-0.5">
+          <span className="text-[10px] text-slate-400">{lbl}</span>
+          <input
+            type="number"
+            min={0}
+            step={0.01}
+            value={val}
+            placeholder={ph}
+            onChange={(e) => !readOnly && on(e.target.value)}
+            readOnly={readOnly}
+            className={`w-16 rounded border px-1.5 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:outline-none disabled:opacity-60 ${accent}`}
+          />
+        </div>
+      ))}
+    </div>
+  );
+
+  // Strike toggle shown at the end of a line item's description cell.
+  const excludeToggle = (key: string) =>
+    !readOnly && (
+      <button
+        type="button"
+        onClick={() => toggleExcludedItem(key)}
+        title={excludedItems.has(key) ? 'Include in bid' : 'Exclude from bid'}
+        className={`ml-2 rounded px-1.5 py-0.5 align-middle text-[10px] font-semibold transition-colors ${
+          excludedItems.has(key)
+            ? 'bg-rose-600 text-white hover:bg-rose-500'
+            : 'border border-slate-200 text-slate-300 hover:border-rose-300 hover:text-rose-600'
+        }`}
+      >
+        {excludedItems.has(key) ? 'Excluded' : 'Exclude'}
+      </button>
+    );
 
   const handleAiPricing = async () => {
     if (!zipCode.trim()) return;
     setAiLoading(true);
     setAiError(null);
     setAiFilled(null);
+    setAiTokens(null);
+    setAiDurationMs(null);
+    const startedAt = Date.now();
 
     const seen = new Set<string>();
     const lineItems: { trade: string; description: string; unit: string }[] = [];
-    for (const section of sections) {
+    for (const section of renderSections) {
       for (const item of section.items) {
         const key = bidKey(section.trade, item.description);
         if (!seen.has(key)) {
@@ -809,28 +1089,38 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
     }
 
     try {
-      const prices = await getLocalPricing(zipCode.trim(), lineItems, takeoffId);
+      const { prices, totalTokens } = await getLocalPricing(zipCode.trim(), lineItems, takeoffId);
       const now = new Date();
       const zip = zipCode.trim();
       setAiPrices(prices);
       setAiPricesUpdatedAt(now);
       setAiPricesZipCode(zip);
       setAiFilled(Object.keys(prices).length);
+      setAiTokens(totalTokens);
+      setAiDurationMs(Date.now() - startedAt);
       setZipPromptOpen(false);
 
       // Auto-save AI prices immediately. Use only actual manual overrides for `prices`
       // (not initialBid.prices, which may contain stale AI prices from a prior save).
-      const manualOnly = Object.fromEntries(
-        Object.entries(manualPrices)
-          .map(([k, v]) => [k, parseFloat(v)])
-          .filter(([, v]) => (v as number) > 0),
-      ) as Record<string, number>;
+      const manualOnly: Record<string, PriceValue> = {};
+      for (const k of Object.keys(manualPrices)) {
+        const mp = manualPrices[k];
+        if (mp.material !== '' || mp.labor !== '') {
+          manualOnly[k] = {
+            material: mp.material ? parseFloat(mp.material) || 0 : priceParts(prices[k]).material,
+            labor: mp.labor ? parseFloat(mp.labor) || 0 : priceParts(prices[k]).labor,
+          };
+        }
+      }
       const savedData = await saveBid(takeoffId, {
         prices: manualOnly,
         aiPrices: prices,
         aiPricesUpdatedAt: now.toISOString(),
         aiPricesZipCode: zip,
         delegations: initialBid?.delegations,
+        excludedTrades: initialBid?.excludedTrades,
+        excludedItems: excludedItems.size > 0 ? [...excludedItems] : undefined,
+        customItems: customItems.length > 0 ? customItems : undefined,
         overheadPct: initialBid?.overheadPct ?? 10,
         profitPct: initialBid?.profitPct ?? 10,
         contingencyPct: initialBid?.contingencyPct ?? 5,
@@ -847,13 +1137,13 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
     setSaving(true);
     setSaveError(null);
     try {
-      const prices: Record<string, number> = {};
-      for (const section of sections) {
+      const prices: Record<string, PriceValue> = {};
+      for (const section of renderSections) {
         const del = delegations[section.trade];
         for (const item of section.items) {
           const key = bidKey(section.trade, item.description);
-          const p = del ? (del.prices[key] ?? 0) : effectiveUnitPrice(key);
-          if (p > 0) prices[key] = p;
+          const parts = del ? priceParts(del.prices[key]) : effectiveParts(key);
+          if (parts.material + parts.labor > 0) prices[key] = parts;
         }
       }
       const saved = await saveBid(takeoffId, {
@@ -862,6 +1152,9 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
         aiPricesUpdatedAt: aiPricesUpdatedAt?.toISOString(),
         aiPricesZipCode: aiPricesZipCode ?? undefined,
         delegations: Object.keys(delegations).length > 0 ? delegations : undefined,
+        excludedTrades: initialBid?.excludedTrades,
+        excludedItems: excludedItems.size > 0 ? [...excludedItems] : undefined,
+        customItems: customItems.length > 0 ? customItems : undefined,
         overheadPct: initialBid?.overheadPct ?? 10,
         profitPct: initialBid?.profitPct ?? 10,
         contingencyPct: initialBid?.contingencyPct ?? 5,
@@ -874,6 +1167,24 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
       setSaving(false);
     }
   };
+
+  // Save action mirrored at the top and bottom of the panel for convenience.
+  const saveRow = !readOnly && (
+    <div className="mt-6 flex items-center justify-end gap-3">
+      {saveError && <span className="text-xs text-red-600">{saveError}</span>}
+      {savedAt && !saveError && (
+        <span className="text-xs text-slate-400">Saved {format(savedAt, 'h:mm a')}</span>
+      )}
+      <button
+        type="button"
+        onClick={handleSave}
+        disabled={saving}
+        className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:bg-slate-300"
+      >
+        {saving ? 'Saving…' : 'Save pricing'}
+      </button>
+    </div>
+  );
 
   return (
     <div className="mt-4">
@@ -901,8 +1212,10 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
             Clear overrides
           </button>
           {aiFilled !== null && (
-            <span className="text-xs text-green-700">
+            <span className="text-xs tabular-nums text-green-700">
               ✓ Filled {aiFilled} price{aiFilled !== 1 ? 's' : ''}
+              {aiTokens != null && ` · ${fmtTokens(aiTokens)} tokens`}
+              {aiDurationMs != null && ` · ${fmtClock(aiDurationMs)}`}
             </span>
           )}
           {aiPricesUpdatedAt && aiFilled === null && (
@@ -934,21 +1247,24 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
               {aiLoading ? 'Fetching…' : 'Get pricing'}
             </button>
             {aiLoading && (
-              <span className="text-xs text-slate-400">This may take 15–30 seconds…</span>
+              <span className="text-xs tabular-nums text-slate-400">Estimating… {fmtClock(aiElapsedMs)} (usually 15–30s)</span>
             )}
             {aiError && <span className="text-xs text-red-600">{aiError}</span>}
           </div>
         )}
       </div>}
 
+      {saveRow}
+
       {/* Line items by trade */}
-      {sections.map((section, i) => {
+      {renderSections.map((section, i) => {
         const del = delegations[section.trade];
         const delegatedSub = del ? subcontractors.find((s) => s.id === del.subId) : null;
-        const sectionTotal = section.items.reduce(
-          (sum, item) => sum + item.quantity * effectiveUnitPrice(bidKey(section.trade, item.description), section.trade),
-          0,
-        );
+        const sectionTotal = section.items.reduce((sum, item) => {
+          const k = bidKey(section.trade, item.description);
+          if (excludedItems.has(k)) return sum;
+          return sum + item.quantity * effectiveUnitPrice(k, section.trade);
+        }, 0);
         return (
           <div key={`${section.trade}-${i}`} className="mt-5">
             {/* Section header */}
@@ -997,21 +1313,25 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                   <thead>
                     <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                       <th className="py-1.5 pr-3 font-medium">Item</th>
-                      <th className="w-16 py-1.5 pr-3 text-right font-medium">Qty</th>
-                      <th className="w-16 py-1.5 pr-3 font-medium">Unit</th>
-                      <th className="w-28 py-1.5 pr-3 text-right font-medium">Sub quote</th>
+                      <th className="w-12 py-1.5 pr-3 text-right font-medium">Qty</th>
+                      <th className="w-12 py-1.5 pr-3 font-medium">Unit</th>
+                      <th className="w-44 py-1.5 pr-3 text-right font-medium">Sub quote (mat / labor)</th>
                       <th className="w-24 py-1.5 text-right font-medium">Total</th>
                     </tr>
                   </thead>
                   <tbody>
                     {section.items.filter((item) => del.prices[bidKey(section.trade, item.description)] != null).map((item, i) => {
                       const key = bidKey(section.trade, item.description);
-                      const subPrice = del.prices[key];
-                      const lineTotal = item.quantity * (subPrice ?? 0);
+                      const parts = priceParts(del.prices[key]);
+                      const lineTotal = item.quantity * (parts.material + parts.labor);
+                      const itemExcluded = excludedItems.has(key);
                       return (
-                        <tr key={i} className="border-b border-slate-50 align-middle">
+                        <tr key={i} className={`border-b border-slate-50 align-middle ${itemExcluded ? 'bg-rose-50/50' : ''}`}>
                           <td className="py-1.5 pr-3 text-slate-700">
-                            <AcronymText text={item.description} />
+                            <span className={itemExcluded ? 'text-rose-400 line-through' : undefined}>
+                              <AcronymText text={item.description} />
+                            </span>
+                            {excludeToggle(key)}
                             {item.notes && (
                               <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                             )}
@@ -1021,31 +1341,17 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                           </td>
                           <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                           <td className="py-1 pr-3">
-                            <div className="flex items-center justify-end gap-0.5">
-                              <span className="text-xs text-slate-400">$</span>
-                              <input
-                                type="number"
-                                min={0}
-                                step={0.01}
-                                value={subPrice != null ? String(subPrice) : ''}
-                                onChange={(e) => {
-                                  if (readOnly) return;
-                                  const val = parseFloat(e.target.value) || 0;
-                                  setDelegations((prev) => ({
-                                    ...prev,
-                                    [section.trade]: {
-                                      ...prev[section.trade],
-                                      prices: { ...prev[section.trade].prices, [key]: val },
-                                    },
-                                  }));
-                                }}
-                                readOnly={readOnly}
-                                placeholder="0"
-                                className="w-24 rounded border border-violet-200 bg-violet-50/40 px-2 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:border-violet-400 focus:outline-none disabled:opacity-60"
-                              />
-                            </div>
+                            {priceInputs(
+                              parts.material ? String(parts.material) : '',
+                              parts.labor ? String(parts.labor) : '',
+                              '0',
+                              '0',
+                              (v) => setDelegationComponent(section.trade, key, 'material', v),
+                              (v) => setDelegationComponent(section.trade, key, 'labor', v),
+                              'border-violet-200 bg-violet-50/40 focus:border-violet-400',
+                            )}
                           </td>
-                          <td className="py-1.5 text-right tabular-nums text-slate-700">
+                          <td className={`py-1.5 text-right tabular-nums ${itemExcluded ? 'text-rose-300 line-through' : 'text-slate-700'}`}>
                             {lineTotal > 0 ? fmt(lineTotal) : '—'}
                           </td>
                         </tr>
@@ -1060,23 +1366,43 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                 <thead>
                   <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                     <th className="py-1.5 pr-3 font-medium">Item</th>
-                    <th className="w-16 py-1.5 pr-3 text-right font-medium">Qty</th>
-                    <th className="w-16 py-1.5 pr-3 font-medium">Unit</th>
-                    <th className="w-24 py-1.5 pr-3 text-right font-medium">AI price</th>
-                    <th className="w-28 py-1.5 pr-3 text-right font-medium">Override</th>
+                    <th className="w-12 py-1.5 pr-3 text-right font-medium">Qty</th>
+                    <th className="w-12 py-1.5 pr-3 font-medium">Unit</th>
+                    <th className="w-24 py-1.5 pr-3 text-right font-medium">AI (mat / labor)</th>
+                    <th className="w-44 py-1.5 pr-3 text-right font-medium">Override (mat / labor)</th>
                     <th className="w-24 py-1.5 text-right font-medium">Total</th>
                   </tr>
                 </thead>
                 <tbody>
                   {section.items.map((item, i) => {
                     const key = bidKey(section.trade, item.description);
-                    const aiPrice = aiPrices[key];
-                    const manualVal = manualPrices[key] ?? '';
+                    const ai = aiPrices[key];
+                    const mp = manualPrices[key];
                     const lineTotal = item.quantity * effectiveUnitPrice(key);
+                    const itemExcluded = excludedItems.has(key);
+                    const isCustom = !!item.isCustom;
                     return (
-                      <tr key={i} className="border-b border-slate-50 align-middle">
+                      <tr key={i} className={`border-b border-slate-50 align-middle ${itemExcluded ? 'bg-rose-50/50' : isCustom ? 'bg-indigo-50/60' : ''}`}>
                         <td className="py-1.5 pr-3 text-slate-700">
-                          <AcronymText text={item.description} />
+                          <span className={itemExcluded ? 'text-rose-400 line-through' : isCustom ? 'font-medium text-indigo-900' : undefined}>
+                            <AcronymText text={item.description} />
+                          </span>
+                          {isCustom && (
+                            <span className="ml-2 rounded bg-indigo-100 px-1.5 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
+                              Custom
+                            </span>
+                          )}
+                          {isCustom && !readOnly && (
+                            <button
+                              type="button"
+                              onClick={() => removeCustomItem(section.trade, item.description)}
+                              title="Remove this custom item"
+                              className="ml-1.5 rounded px-1 align-middle text-[11px] font-semibold text-slate-300 transition-colors hover:text-red-600"
+                            >
+                              ✕
+                            </button>
+                          )}
+                          {excludeToggle(key)}
                           {item.notes && (
                             <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                           )}
@@ -1085,28 +1411,19 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                           {item.quantity.toLocaleString()}
                         </td>
                         <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
-                        <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
-                          {aiPrice != null ? fmt(aiPrice) : '—'}
-                        </td>
+                        <td className="py-1.5 pr-3">{aiCell(ai)}</td>
                         <td className="py-1 pr-3">
-                          <div className="flex items-center justify-end gap-0.5">
-                            <span className="text-xs text-slate-400">$</span>
-                            <input
-                              type="number"
-                              min={0}
-                              step={0.01}
-                              value={manualVal}
-                              onChange={(e) => {
-                                if (readOnly) return;
-                                setManualPrices((prev) => ({ ...prev, [key]: e.target.value }));
-                              }}
-                              readOnly={readOnly}
-                              placeholder={aiPrice != null ? String(aiPrice) : '0'}
-                              className="w-24 rounded border border-slate-200 px-2 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:border-blue-400 focus:outline-none disabled:opacity-60"
-                            />
-                          </div>
+                          {priceInputs(
+                            mp?.material ?? '',
+                            mp?.labor ?? '',
+                            ai ? String(ai.material) : '0',
+                            ai ? String(ai.labor) : '0',
+                            (v) => setManualComponent(key, 'material', v),
+                            (v) => setManualComponent(key, 'labor', v),
+                            'border-slate-200 focus:border-blue-400',
+                          )}
                         </td>
-                        <td className="py-1.5 text-right tabular-nums text-slate-700">
+                        <td className={`py-1.5 text-right tabular-nums ${itemExcluded ? 'text-rose-300 line-through' : 'text-slate-700'}`}>
                           {lineTotal > 0 ? fmt(lineTotal) : '—'}
                         </td>
                       </tr>
@@ -1115,29 +1432,49 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
                 </tbody>
               </table>
             )}
+
+            {/* Append a custom item to this trade */}
+            {!del && !readOnly && (
+              addItemTrade === section.trade ? (
+                addItemForm(() => commitCustomItem(section.trade), false)
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => openItemForm(section.trade)}
+                  className="mt-2 flex items-center gap-1.5 text-xs font-medium text-slate-400 transition-colors hover:text-indigo-700"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>
+                  Add item to {section.trade}
+                </button>
+              )
+            )}
           </div>
         );
       })}
 
-      {/* Save row */}
+      {/* Add a new trade (with its first line item) */}
       {!readOnly && (
-        <div className="mt-6 flex items-center justify-end gap-3">
-          {saveError && <span className="text-xs text-red-600">{saveError}</span>}
-          {savedAt && !saveError && (
-            <span className="text-xs text-slate-400">
-              Saved {format(savedAt, 'h:mm a')}
-            </span>
+        <div className="mt-6 border-t border-slate-100 pt-4">
+          {newTradeOpen ? (
+            addItemForm(() => commitCustomItem(draftTradeName), true)
+          ) : (
+            <button
+              type="button"
+              onClick={openNewTradeForm}
+              className="flex items-center gap-1.5 rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:border-indigo-300 hover:text-indigo-700"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>
+              Add a new trade
+            </button>
           )}
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving}
-            className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:bg-slate-300"
-          >
-            {saving ? 'Saving…' : 'Save pricing'}
-          </button>
+          <p className="mt-2 text-[11px] text-slate-400">
+            Custom items are kept separate from the AI takeoff — delete them any time to revert to the original.
+          </p>
         </div>
       )}
+
+      {/* Save row */}
+      {saveRow}
 
       {/* Delegate modal */}
       {delegateModalTrade && (
@@ -1223,6 +1560,8 @@ function BidsPanel({
   const savedPrices = initialBid?.prices ?? {};
   const aiPrices = initialBid?.aiPrices ?? {};
   const delegations = initialBid?.delegations ?? {};
+  // Line items struck out on the Pricing tab — hidden here and dropped from totals.
+  const excludedItems = new Set(initialBid?.excludedItems ?? []);
 
   const [overheadPct, setOverheadPct] = useState(String(initialBid?.overheadPct ?? 10));
   const [profitPct, setProfitPct] = useState(String(initialBid?.profitPct ?? 10));
@@ -1231,11 +1570,23 @@ function BidsPanel({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
 
+  const navigate = useNavigate();
   const [finalizeConfirmOpen, setFinalizeConfirmOpen] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [finalizeError, setFinalizeError] = useState<string | null>(null);
+  const [quote, setQuote] = useState<BidQuote | null>(null);
+  const [insufficient, setInsufficient] = useState(false);
   const [unfinalizing, setUnfinalizing] = useState(false);
   const [unfinalizeError, setUnfinalizeError] = useState<string | null>(null);
+
+  // Load the tier/price/balance quote when the finalize modal opens.
+  useEffect(() => {
+    if (!finalizeConfirmOpen) return;
+    setQuote(null);
+    setInsufficient(false);
+    setFinalizeError(null);
+    bidQuote(takeoffId).then(setQuote).catch(() => setQuote(null));
+  }, [finalizeConfirmOpen, takeoffId]);
 
   const [shareOpen, setShareOpen] = useState(false);
   const [shareEmail, setShareEmail] = useState('');
@@ -1256,10 +1607,11 @@ function BidsPanel({
       return next;
     });
 
-  const effectivePrice = (key: string, trade?: string): number => {
-    if (trade && delegations[trade]) return delegations[trade].prices[key] ?? 0;
+  const effectiveParts = (key: string, trade?: string): PriceParts => {
+    if (trade && delegations[trade]) return priceParts(delegations[trade].prices[key]);
     const saved = savedPrices[key];
-    if (saved !== undefined && saved > 0) return saved;
+    if (saved !== undefined && priceTotal(saved) > 0) return priceParts(saved);
+    // Pricing-matrix fallback is a single rate with no split — treat it as material.
     const matrixRate = (() => {
       for (const s of sections) {
         const item = s.items.find((i) => bidKey(s.trade, i.description) === key);
@@ -1267,39 +1619,75 @@ function BidsPanel({
       }
       return undefined;
     })();
-    return matrixRate ?? 0;
+    return { material: matrixRate ?? 0, labor: 0 };
   };
 
   const priceSource = (key: string, trade?: string): 'ai' | 'override' | 'sub' | null => {
     if (trade && delegations[trade]) {
-      const subPrice = delegations[trade].prices[key];
-      return subPrice != null && subPrice > 0 ? 'sub' : null;
+      return priceTotal(delegations[trade].prices[key]) > 0 ? 'sub' : null;
     }
-    const price = savedPrices[key];
-    if (price === undefined || price === 0) return null;
+    const saved = savedPrices[key];
+    if (saved === undefined || priceTotal(saved) === 0) return null;
+    const sp = priceParts(saved);
     const ai = aiPrices[key];
-    if (ai !== undefined && price === ai) return 'ai';
+    if (ai !== undefined) {
+      const ap = priceParts(ai);
+      if (sp.material === ap.material && sp.labor === ap.labor) return 'ai';
+    }
     return 'override';
   };
 
-  const sectionRows = sections.map((s) => {
-    const del = delegations[s.trade];
-    return {
-      trade: s.trade,
-      delegation: del,
-      items: s.items.map((item) => {
-        const key = bidKey(s.trade, item.description);
-        const unitPrice = effectivePrice(key, s.trade);
-        return { ...item, key, unitPrice, source: priceSource(key, s.trade), lineTotal: item.quantity * unitPrice };
-      }),
-      get subtotal() {
-        return this.items.reduce((sum, i) => sum + i.lineTotal, 0);
-      },
-    };
-  });
+  // Merge user-added custom items in so they appear in the bid and its totals.
+  const mergedSections = mergeSections(sections, initialBid?.customItems);
+  const sectionRows = mergedSections
+    .map((s) => {
+      const del = delegations[s.trade];
+      return {
+        trade: s.trade,
+        delegation: del,
+        // Struck-out items are dropped here so they're hidden and uncounted in the bid.
+        items: s.items
+          .filter((item) => !excludedItems.has(bidKey(s.trade, item.description)))
+          .map((item) => {
+            const key = bidKey(s.trade, item.description);
+            const parts = effectiveParts(key, s.trade);
+            const lineMaterial = item.quantity * parts.material;
+            const lineLabor = item.quantity * parts.labor;
+            return {
+              ...item,
+              key,
+              parts,
+              unitPrice: parts.material + parts.labor,
+              source: priceSource(key, s.trade),
+              lineMaterial,
+              lineLabor,
+              lineTotal: lineMaterial + lineLabor,
+            };
+          }),
+        get subtotal() {
+          return this.items.reduce((sum, i) => sum + i.lineTotal, 0);
+        },
+        get materialSubtotal() {
+          return this.items.reduce((sum, i) => sum + i.lineMaterial, 0);
+        },
+        get laborSubtotal() {
+          return this.items.reduce((sum, i) => sum + i.lineLabor, 0);
+        },
+      };
+    })
+    // A section whose items are all excluded disappears from the bid entirely.
+    .filter((s) => s.items.length > 0);
 
   const directCost = sectionRows.reduce(
     (sum, s) => sum + (excludedTrades.has(s.trade) ? 0 : s.subtotal),
+    0,
+  );
+  const materialDirect = sectionRows.reduce(
+    (sum, s) => sum + (excludedTrades.has(s.trade) ? 0 : s.materialSubtotal),
+    0,
+  );
+  const laborDirect = sectionRows.reduce(
+    (sum, s) => sum + (excludedTrades.has(s.trade) ? 0 : s.laborSubtotal),
     0,
   );
   const oh = directCost * (parseFloat(overheadPct) || 0) / 100;
@@ -1318,6 +1706,8 @@ function BidsPanel({
         aiPricesZipCode: initialBid?.aiPricesZipCode,
         delegations: Object.keys(delegations).length > 0 ? delegations : undefined,
         excludedTrades: excludedTrades.size > 0 ? [...excludedTrades] : undefined,
+        excludedItems: initialBid?.excludedItems,
+        customItems: initialBid?.customItems,
         overheadPct: parseFloat(overheadPct) || 0,
         profitPct: parseFloat(profitPct) || 0,
         contingencyPct: parseFloat(contingencyPct) || 0,
@@ -1334,12 +1724,18 @@ function BidsPanel({
   const handleFinalize = async () => {
     setFinalizing(true);
     setFinalizeError(null);
+    setInsufficient(false);
     try {
       const saved = await finalizeBid(takeoffId);
       onSaved(saved);
+      notifyCreditsChanged(); // refresh the header balance after the charge
       setFinalizeConfirmOpen(false);
     } catch (err) {
-      setFinalizeError(err instanceof Error ? err.message : 'Finalize failed.');
+      if (err instanceof InsufficientCreditsError) {
+        setInsufficient(true);
+      } else {
+        setFinalizeError(err instanceof Error ? err.message : 'Finalize failed.');
+      }
     } finally {
       setFinalizing(false);
     }
@@ -1408,8 +1804,78 @@ function BidsPanel({
     </div>
   );
 
+  // Save / Finalize / Share actions, mirrored at the top and bottom of the panel.
+  const actionRow = initialBid?.finalizedAt ? (
+    <div className="mt-4 flex items-center justify-between gap-3">
+      <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 px-3 py-2">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-green-600" aria-hidden="true">
+          <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
+        </svg>
+        <span className="text-xs font-medium text-green-800">
+          Finalized {format(new Date(initialBid.finalizedAt), 'MMM d, yyyy')}
+        </span>
+      </div>
+      <div className="flex items-center gap-3">
+        {unfinalizeError && <span className="text-xs text-red-600">{unfinalizeError}</span>}
+        {/* A sent bid is permanently locked — un-finalize is only offered beforehand. */}
+        {!initialBid.sentAt && (
+          <button
+            type="button"
+            onClick={handleUnfinalize}
+            disabled={unfinalizing}
+            className="rounded-lg border border-slate-300 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-amber-400 hover:text-amber-700 disabled:cursor-wait disabled:opacity-50"
+          >
+            {unfinalizing ? 'Un-finalizing…' : 'Un-finalize'}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => { setShareOpen(true); setShareMode(sharingMode); setShareSuccess(false); setShareError(null); }}
+          className="flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" strokeLinecap="round" strokeLinejoin="round" />
+            <polyline points="16 6 12 2 8 6" strokeLinecap="round" strokeLinejoin="round" />
+            <line x1="12" y1="2" x2="12" y2="15" strokeLinecap="round" />
+          </svg>
+          Share bid
+        </button>
+      </div>
+    </div>
+  ) : !readOnly && (() => {
+    const allApproved = Object.keys(delegations).length === 0 ||
+      Object.values(delegations).every((d) => !!d.approvedAt);
+    return (
+      <div className="mt-4 flex items-center justify-end gap-3">
+        {saveError && <span className="text-xs text-red-600">{saveError}</span>}
+        {savedAt && !saveError && (
+          <span className="text-xs text-slate-400">Saved {format(savedAt, 'h:mm a')}</span>
+        )}
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="rounded-lg border border-slate-200 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-wait disabled:opacity-50"
+        >
+          {saving ? 'Saving…' : 'Save bid'}
+        </button>
+        <button
+          type="button"
+          onClick={() => setFinalizeConfirmOpen(true)}
+          disabled={!allApproved || totalBid === 0}
+          title={!allApproved ? 'All delegated bids must be approved before finalizing' : undefined}
+          className="rounded-lg bg-green-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-green-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+        >
+          Finalize bid
+        </button>
+      </div>
+    );
+  })();
+
   return (
     <div className="mt-4">
+      {actionRow}
+
       {sectionRows.map((section, i) => {
         const delegatedSub = section.delegation
           ? subcontractors.find((s) => s.id === section.delegation!.subId)
@@ -1468,9 +1934,10 @@ function BidsPanel({
                 <thead>
                   <tr className="border-b border-slate-200 text-left text-xs uppercase text-slate-400">
                     <th className="py-1.5 pr-2 font-medium">Item</th>
-                    <th className="w-16 py-1.5 pr-2 text-right font-medium">Qty</th>
-                    <th className="w-16 py-1.5 pr-2 font-medium">Unit</th>
-                    <th className="w-32 py-1.5 pr-2 text-right font-medium">Unit price</th>
+                    <th className="w-12 py-1.5 pr-2 text-right font-medium">Qty</th>
+                    <th className="w-12 py-1.5 pr-2 font-medium">Unit</th>
+                    <th className="w-24 py-1.5 pr-2 text-right font-medium">Material</th>
+                    <th className="w-24 py-1.5 pr-2 text-right font-medium">Labor</th>
                     <th className="w-24 py-1.5 text-right font-medium">Total</th>
                   </tr>
                 </thead>
@@ -1478,7 +1945,18 @@ function BidsPanel({
                   {section.items.map((item) => (
                     <tr key={item.key} className="border-b border-slate-100 align-middle">
                       <td className="py-1.5 pr-2 text-slate-700">
-                        <AcronymText text={item.description} />
+                        <span className="inline-flex items-center gap-1.5">
+                          <AcronymText text={item.description} />
+                          {item.source === 'ai' && (
+                            <Tooltip content="Artificial intelligence — AI-estimated price" className="cursor-help rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">AI</Tooltip>
+                          )}
+                          {item.source === 'override' && (
+                            <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Override</span>
+                          )}
+                          {item.source === 'sub' && (
+                            <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium text-violet-700">Sub quote</span>
+                          )}
+                        </span>
                         {item.notes && (
                           <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
                         )}
@@ -1487,21 +1965,11 @@ function BidsPanel({
                         {item.quantity.toLocaleString()}
                       </td>
                       <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
-                      <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
-                        {item.unitPrice > 0 ? (
-                          <div className="flex items-center justify-end gap-1.5">
-                            {item.source === 'ai' && (
-                              <Tooltip content="Artificial intelligence — AI-estimated price" className="cursor-help rounded-full bg-blue-100 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">AI</Tooltip>
-                            )}
-                            {item.source === 'override' && (
-                              <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700">Override</span>
-                            )}
-                            {item.source === 'sub' && (
-                              <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-[10px] font-medium text-violet-700">Sub quote</span>
-                            )}
-                            {fmt(item.unitPrice)}
-                          </div>
-                        ) : '—'}
+                      <td className="py-1.5 pr-2 text-right tabular-nums text-slate-600">
+                        {item.lineMaterial > 0 ? fmt(item.lineMaterial) : '—'}
+                      </td>
+                      <td className="py-1.5 pr-2 text-right tabular-nums text-slate-600">
+                        {item.lineLabor > 0 ? fmt(item.lineLabor) : '—'}
                       </td>
                       <td className="py-1.5 text-right tabular-nums text-slate-700">
                         {item.lineTotal > 0 ? fmt(item.lineTotal) : '—'}
@@ -1509,8 +1977,14 @@ function BidsPanel({
                     </tr>
                   ))}
                   <tr className="bg-slate-50">
-                    <td colSpan={4} className="py-1.5 pr-2 text-right text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    <td colSpan={3} className="py-1.5 pr-2 text-right text-xs font-semibold uppercase tracking-wide text-slate-500">
                       Subtotal
+                    </td>
+                    <td className="py-1.5 pr-2 text-right text-sm font-semibold tabular-nums text-slate-600">
+                      {section.materialSubtotal > 0 ? fmt(section.materialSubtotal) : '—'}
+                    </td>
+                    <td className="py-1.5 pr-2 text-right text-sm font-semibold tabular-nums text-slate-600">
+                      {section.laborSubtotal > 0 ? fmt(section.laborSubtotal) : '—'}
                     </td>
                     <td className="py-1.5 text-right text-sm font-semibold tabular-nums text-slate-800">
                       {section.subtotal > 0 ? fmt(section.subtotal) : '—'}
@@ -1526,7 +2000,15 @@ function BidsPanel({
 
       {/* Markup & totals */}
       <div className="mt-6 rounded-xl border border-slate-200 p-4">
-        <div className="flex items-center justify-between border-b border-slate-100 pb-2 text-sm font-semibold text-slate-700">
+        <div className="flex items-center justify-between py-1 text-sm text-slate-500">
+          <span>Materials</span>
+          <span className="tabular-nums">{materialDirect > 0 ? fmt(materialDirect) : '—'}</span>
+        </div>
+        <div className="flex items-center justify-between py-1 text-sm text-slate-500">
+          <span>Labor</span>
+          <span className="tabular-nums">{laborDirect > 0 ? fmt(laborDirect) : '—'}</span>
+        </div>
+        <div className="flex items-center justify-between border-y border-slate-100 py-2 text-sm font-semibold text-slate-700">
           <span>Direct cost</span>
           <span className="tabular-nums">{directCost > 0 ? fmt(directCost) : '—'}</span>
         </div>
@@ -1541,75 +2023,8 @@ function BidsPanel({
         </div>
       </div>
 
-      {/* Save / Finalize row */}
-      {initialBid?.finalizedAt ? (
-        <div className="mt-4 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 px-3 py-2">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-green-600" aria-hidden="true">
-              <path d="M20 6 9 17l-5-5" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-            <span className="text-xs font-medium text-green-800">
-              Finalized {format(new Date(initialBid.finalizedAt), 'MMM d, yyyy')}
-            </span>
-          </div>
-          <div className="flex items-center gap-3">
-            {unfinalizeError && <span className="text-xs text-red-600">{unfinalizeError}</span>}
-            {/* A sent bid is permanently locked — un-finalize is only offered beforehand. */}
-            {!initialBid.sentAt && (
-              <button
-                type="button"
-                onClick={handleUnfinalize}
-                disabled={unfinalizing}
-                className="rounded-lg border border-slate-300 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-amber-400 hover:text-amber-700 disabled:cursor-wait disabled:opacity-50"
-              >
-                {unfinalizing ? 'Un-finalizing…' : 'Un-finalize'}
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => { setShareOpen(true); setShareMode(sharingMode); setShareSuccess(false); setShareError(null); }}
-              className="flex items-center gap-2 rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
-                <path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" strokeLinecap="round" strokeLinejoin="round" />
-                <polyline points="16 6 12 2 8 6" strokeLinecap="round" strokeLinejoin="round" />
-                <line x1="12" y1="2" x2="12" y2="15" strokeLinecap="round" />
-              </svg>
-              Share bid
-            </button>
-          </div>
-        </div>
-      ) : !readOnly && (() => {
-        const allApproved = Object.keys(delegations).length === 0 ||
-          Object.values(delegations).every((d) => !!d.approvedAt);
-        return (
-          <div className="mt-4 flex items-center justify-end gap-3">
-            {saveError && <span className="text-xs text-red-600">{saveError}</span>}
-            {savedAt && !saveError && (
-              <span className="text-xs text-slate-400">
-                Saved {format(savedAt, 'h:mm a')}
-              </span>
-            )}
-            <button
-              type="button"
-              onClick={handleSave}
-              disabled={saving}
-              className="rounded-lg border border-slate-200 bg-white px-5 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:bg-slate-50 disabled:cursor-wait disabled:opacity-50"
-            >
-              {saving ? 'Saving…' : 'Save bid'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setFinalizeConfirmOpen(true)}
-              disabled={!allApproved || totalBid === 0}
-              title={!allApproved ? 'All delegated bids must be approved before finalizing' : undefined}
-              className="rounded-lg bg-green-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-green-500 disabled:cursor-not-allowed disabled:bg-slate-300"
-            >
-              Finalize bid
-            </button>
-          </div>
-        );
-      })()}
+      {/* Save / Finalize row (mirrored at the top of the panel) */}
+      {actionRow}
 
       {/* Finalize confirmation modal */}
       {finalizeConfirmOpen && (
@@ -1620,9 +2035,42 @@ function BidsPanel({
               Finalizing locks the takeoff, materials list, pricing, and bid as read-only. You can
               un-finalize to make changes any time before the bid is sent to the customer.
             </p>
+
+            {/* Pricing summary from the quote */}
+            {quote && (
+              <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm">
+                {quote.alreadyPaid ? (
+                  <p className="text-slate-600">
+                    This bid is already paid for — finalizing again won&rsquo;t charge you.
+                  </p>
+                ) : (
+                  <>
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-600">
+                        Charge (<span className="capitalize">{quote.tier}</span> bid)
+                      </span>
+                      <span className="font-semibold tabular-nums text-slate-900">
+                        {fmt(quote.priceCents / 100)}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
+                      <span>Credit balance</span>
+                      <span className="tabular-nums">{fmt(quote.balanceCents / 100)}</span>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+            {insufficient && (
+              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                Not enough credits to finalize this bid. Add credits and try again.
+              </div>
+            )}
             {finalizeError && (
               <p className="mt-3 text-sm text-red-600">{finalizeError}</p>
             )}
+
             <div className="mt-5 flex justify-end gap-3">
               <button
                 type="button"
@@ -1632,14 +2080,28 @@ function BidsPanel({
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                onClick={handleFinalize}
-                disabled={finalizing}
-                className="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white hover:bg-green-500 disabled:cursor-wait disabled:bg-slate-300"
-              >
-                {finalizing ? 'Finalizing…' : 'Yes, finalize'}
-              </button>
+              {insufficient ? (
+                <button
+                  type="button"
+                  onClick={() => navigate('/billing')}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-500"
+                >
+                  Buy credits
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleFinalize}
+                  disabled={finalizing}
+                  className="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white hover:bg-green-500 disabled:cursor-wait disabled:bg-slate-300"
+                >
+                  {finalizing
+                    ? 'Finalizing…'
+                    : quote && !quote.alreadyPaid
+                    ? `Pay ${fmt(quote.priceCents / 100)} & finalize`
+                    : 'Yes, finalize'}
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -1746,31 +2208,70 @@ interface SubPricingPanelProps {
 }
 
 function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPricingPanelProps) {
-  const [prices, setPrices] = useState<Record<string, string>>(() => {
-    const init: Record<string, string> = {};
+  // The sub's quote, entered as separate material + labor components (strings for inputs).
+  const [prices, setPrices] = useState<Record<string, { material: string; labor: string }>>(() => {
+    const init: Record<string, { material: string; labor: string }> = {};
     for (const section of sections) {
       const del = delegations[section.trade];
       if (del?.manualPrices) {
         for (const [key, val] of Object.entries(del.manualPrices)) {
-          init[key] = String(val);
+          const p = priceParts(val);
+          init[key] = { material: String(p.material), labor: String(p.labor) };
         }
       }
     }
     return init;
   });
 
-  const [aiPrices, setAiPrices] = useState<Record<string, number>>(() => {
-    const init: Record<string, number> = {};
+  const [aiPrices, setAiPrices] = useState<Record<string, PriceParts>>(() => {
+    const init: Record<string, PriceParts> = {};
     for (const section of sections) {
       const del = delegations[section.trade];
       if (del?.aiPrices) {
-        for (const [key, val] of Object.entries(del.aiPrices)) {
-          init[key] = val;
-        }
+        for (const [key, val] of Object.entries(del.aiPrices)) init[key] = priceParts(val);
       }
     }
     return init;
   });
+
+  // Effective material/labor: the sub's typed component if present, else the AI value.
+  const effectiveParts = (key: string, aiMap: Record<string, PriceParts>): PriceParts => {
+    const ai = aiMap[key] ?? { material: 0, labor: 0 };
+    const mp = prices[key];
+    return {
+      material: mp?.material !== undefined && mp.material !== '' ? parseFloat(mp.material) || 0 : ai.material,
+      labor: mp?.labor !== undefined && mp.labor !== '' ? parseFloat(mp.labor) || 0 : ai.labor,
+    };
+  };
+
+  const setSubComponent = (key: string, field: 'material' | 'labor', val: string) =>
+    setPrices((prev) => {
+      const cur = prev[key] ?? { material: '', labor: '' };
+      return { ...prev, [key]: { ...cur, [field]: val } };
+    });
+
+  // Build the per-trade delegation update (prices/aiPrices/manualPrices as PriceParts).
+  const buildDelegations = (aiMap: Record<string, PriceParts>) => {
+    const out: Record<string, SubDelegationUpdate> = {};
+    for (const section of sections) {
+      const entry = (out[section.trade] ??= { prices: {}, aiPrices: {}, manualPrices: {} });
+      for (const item of section.items) {
+        const key = bidKey(section.trade, item.description);
+        const mp = prices[key];
+        const hasManual = !!mp && (mp.material !== '' || mp.labor !== '');
+        const ai = aiMap[key];
+        if (ai) entry.aiPrices![key] = ai;
+        if (hasManual) {
+          entry.manualPrices![key] = {
+            material: mp.material ? parseFloat(mp.material) || 0 : 0,
+            labor: mp.labor ? parseFloat(mp.labor) || 0 : 0,
+          };
+        }
+        if (ai || hasManual) entry.prices[key] = effectiveParts(key, aiMap);
+      }
+    }
+    return out;
+  };
   const [aiPricesUpdatedAt, setAiPricesUpdatedAt] = useState<Date | null>(null);
   const [aiPricesZipCode, setAiPricesZipCode] = useState<string | null>(null);
   const [zipPromptOpen, setZipPromptOpen] = useState(false);
@@ -1778,6 +2279,9 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiFilled, setAiFilled] = useState<number | null>(null);
+  const [aiTokens, setAiTokens] = useState<number | null>(null);
+  const [aiDurationMs, setAiDurationMs] = useState<number | null>(null);
+  const aiElapsedMs = useStopwatch(aiLoading);
 
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -1788,6 +2292,9 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
     setAiLoading(true);
     setAiError(null);
     setAiFilled(null);
+    setAiTokens(null);
+    setAiDurationMs(null);
+    const startedAt = Date.now();
 
     const seen = new Set<string>();
     const lineItems: { trade: string; description: string; unit: string }[] = [];
@@ -1802,31 +2309,19 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
     }
 
     try {
-      const fetched = await getLocalPricing(zipCode.trim(), lineItems, takeoffId);
+      const { prices: fetched, totalTokens } = await getLocalPricing(zipCode.trim(), lineItems, takeoffId);
       const now = new Date();
       const zip = zipCode.trim();
       setAiPrices(fetched);
       setAiPricesUpdatedAt(now);
       setAiPricesZipCode(zip);
       setAiFilled(Object.keys(fetched).length);
+      setAiTokens(totalTokens);
+      setAiDurationMs(Date.now() - startedAt);
       setZipPromptOpen(false);
 
       // Auto-save: store aiPrices, manualPrices, and effective prices separately.
-      // Merge across sections with the same trade name (duplicate sections can exist).
-      const updatedDelegations: Record<string, { prices: Record<string, number>; aiPrices: Record<string, number>; manualPrices: Record<string, number> }> = {};
-      for (const section of sections) {
-        const entry = (updatedDelegations[section.trade] ??= { prices: {}, aiPrices: {}, manualPrices: {} });
-        for (const item of section.items) {
-          const key = bidKey(section.trade, item.description);
-          const val = prices[key] ?? '';
-          const hasManual = val !== '';
-          const aiPrice = fetched[key];
-          if (aiPrice != null) entry.aiPrices[key] = aiPrice;
-          if (hasManual) entry.manualPrices[key] = parseFloat(val);
-          const effective = hasManual ? parseFloat(val) : (aiPrice ?? 0);
-          if (aiPrice != null || hasManual) entry.prices[key] = effective;
-        }
-      }
+      const updatedDelegations = buildDelegations(fetched);
       await saveSubPrices(takeoffId, updatedDelegations);
       const merged: Record<string, DelegationData> = { ...delegations };
       for (const [trade, update] of Object.entries(updatedDelegations)) {
@@ -1844,20 +2339,7 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
     setSaving(true);
     setSaveError(null);
     try {
-      const updatedDelegations: Record<string, { prices: Record<string, number>; aiPrices: Record<string, number>; manualPrices: Record<string, number> }> = {};
-      for (const section of sections) {
-        const entry = (updatedDelegations[section.trade] ??= { prices: {}, aiPrices: {}, manualPrices: {} });
-        for (const item of section.items) {
-          const key = bidKey(section.trade, item.description);
-          const val = prices[key] ?? '';
-          const hasManual = val !== '';
-          const aiPrice = aiPrices[key];
-          if (aiPrice != null) entry.aiPrices[key] = aiPrice;
-          if (hasManual) entry.manualPrices[key] = parseFloat(val);
-          const effective = hasManual ? parseFloat(val) : (aiPrice ?? 0);
-          if (aiPrice != null || hasManual) entry.prices[key] = effective;
-        }
-      }
+      const updatedDelegations = buildDelegations(aiPrices);
       await saveSubPrices(takeoffId, updatedDelegations);
       setSavedAt(new Date());
       const merged: Record<string, DelegationData> = { ...delegations };
@@ -1898,8 +2380,10 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
             Clear overrides
           </button>
           {aiFilled !== null && (
-            <span className="text-xs text-green-700">
+            <span className="text-xs tabular-nums text-green-700">
               ✓ Filled {aiFilled} price{aiFilled !== 1 ? 's' : ''}
+              {aiTokens != null && ` · ${fmtTokens(aiTokens)} tokens`}
+              {aiDurationMs != null && ` · ${fmtClock(aiDurationMs)}`}
             </span>
           )}
           {aiPricesUpdatedAt && aiFilled === null && (
@@ -1931,7 +2415,7 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
               {aiLoading ? 'Fetching…' : 'Get pricing'}
             </button>
             {aiLoading && (
-              <span className="text-xs text-slate-400">This may take 15–30 seconds…</span>
+              <span className="text-xs tabular-nums text-slate-400">Estimating… {fmtClock(aiElapsedMs)} (usually 15–30s)</span>
             )}
             {aiError && <span className="text-xs text-red-600">{aiError}</span>}
           </div>
@@ -1941,9 +2425,8 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
       {sections.map((section, i) => {
         const sectionTotal = section.items.reduce((sum, item) => {
           const key = bidKey(section.trade, item.description);
-          const val = prices[key] ?? '';
-          const unitPrice = val !== '' ? parseFloat(val) : (aiPrices[key] ?? 0);
-          return sum + item.quantity * unitPrice;
+          const p = effectiveParts(key, aiPrices);
+          return sum + item.quantity * (p.material + p.labor);
         }, 0);
 
         return (
@@ -1956,24 +2439,24 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
                 <span className="text-xs tabular-nums text-slate-400">{fmt(sectionTotal)}</span>
               )}
             </div>
-            <table className="mt-1.5 w-full text-sm">
+            <table className="mt-1.5 w-full table-fixed text-sm">
               <thead>
                 <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                   <th className="py-1.5 pr-3 font-medium">Item</th>
-                  <th className="py-1.5 pr-3 text-right font-medium">Qty</th>
-                  <th className="py-1.5 pr-3 font-medium">Unit</th>
-                  <th className="py-1.5 pr-3 text-right font-medium">AI price</th>
-                  <th className="py-1.5 pr-3 text-right font-medium">Your price</th>
-                  <th className="py-1.5 text-right font-medium">Total</th>
+                  <th className="w-12 py-1.5 pr-3 text-right font-medium">Qty</th>
+                  <th className="w-12 py-1.5 pr-3 font-medium">Unit</th>
+                  <th className="w-24 py-1.5 pr-3 text-right font-medium">AI (mat / labor)</th>
+                  <th className="w-44 py-1.5 pr-3 text-right font-medium">Your quote (mat / labor)</th>
+                  <th className="w-24 py-1.5 text-right font-medium">Total</th>
                 </tr>
               </thead>
               <tbody>
                 {section.items.map((item, i) => {
                   const key = bidKey(section.trade, item.description);
-                  const val = prices[key] ?? '';
-                  const aiPrice = aiPrices[key];
-                  const unitPrice = val !== '' ? parseFloat(val) : (aiPrice ?? 0);
-                  const lineTotal = item.quantity * unitPrice;
+                  const mp = prices[key];
+                  const ai = aiPrices[key];
+                  const eff = effectiveParts(key, aiPrices);
+                  const lineTotal = item.quantity * (eff.material + eff.labor);
                   return (
                     <tr key={i} className="border-b border-slate-50 align-middle">
                       <td className="py-1.5 pr-3 text-slate-700">
@@ -1986,23 +2469,34 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
                         {item.quantity.toLocaleString()}
                       </td>
                       <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
-                      <td className="py-1.5 pr-3 text-right tabular-nums text-slate-400">
-                        {aiPrice != null ? fmt(aiPrice) : '—'}
+                      <td className="py-1.5 pr-3">
+                        {ai ? (
+                          <div className="text-right text-xs leading-tight tabular-nums">
+                            <div className="text-slate-500">M {fmt(ai.material)}</div>
+                            <div className="text-slate-400">L {fmt(ai.labor)}</div>
+                          </div>
+                        ) : (
+                          <span className="text-slate-400">—</span>
+                        )}
                       </td>
                       <td className="py-1 pr-3">
-                        <div className="flex items-center justify-end gap-0.5">
-                          <span className="text-xs text-slate-400">$</span>
-                          <input
-                            type="number"
-                            min={0}
-                            step={0.01}
-                            value={val}
-                            onChange={(e) =>
-                              setPrices((prev) => ({ ...prev, [key]: e.target.value }))
-                            }
-                            placeholder={aiPrice != null ? String(aiPrice) : '0'}
-                            className="w-24 rounded border border-violet-200 bg-violet-50/40 px-2 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:border-violet-400 focus:outline-none"
-                          />
+                        <div className="flex items-center justify-end gap-1.5">
+                          {([['M', mp?.material ?? '', ai ? String(ai.material) : '0', 'material'], ['L', mp?.labor ?? '', ai ? String(ai.labor) : '0', 'labor']] as const).map(
+                            ([lbl, v, ph, field]) => (
+                              <div key={lbl} className="flex items-center gap-0.5">
+                                <span className="text-[10px] text-slate-400">{lbl}</span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  step={0.01}
+                                  value={v}
+                                  placeholder={ph}
+                                  onChange={(e) => setSubComponent(key, field, e.target.value)}
+                                  className="w-16 rounded border border-violet-200 bg-violet-50/40 px-1.5 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:border-violet-400 focus:outline-none"
+                                />
+                              </div>
+                            ),
+                          )}
                         </div>
                       </td>
                       <td className="py-1.5 text-right tabular-nums text-slate-700">
@@ -2081,7 +2575,7 @@ function SubBidsPanel({ takeoffId, sections, delegations, gaps, onApproved }: Su
       trade: s.trade,
       items: s.items.map((item) => {
         const key = bidKey(s.trade, item.description);
-        const unitPrice = del?.prices[key] ?? 0;
+        const unitPrice = priceTotal(del?.prices[key]);
         return { ...item, key, unitPrice, lineTotal: item.quantity * unitPrice };
       }),
       get subtotal() {

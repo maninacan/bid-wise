@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import type { BidSharingMode, HousePlan, PricingMatrix, Subcontractor, Takeoff } from '../lib/supabase';
-import { getFinalizedTakeoffForPlan, getTakeoff } from '../lib/supabase';
+import { getFinalizedTakeoffForPlan, getTakeoff, planDisplayName } from '../lib/supabase';
 import { TakeoffView } from './takeoff-view';
 
 interface TakeoffDetailScreenProps {
@@ -21,7 +21,7 @@ export function TakeoffDetailScreen({
   mySubIds,
   onSubcontractorAdded,
 }: TakeoffDetailScreenProps) {
-  const { id } = useParams<{ id: string }>();
+  const { id, planId } = useParams<{ id: string; planId: string }>();
   const navigate = useNavigate();
   const [takeoff, setTakeoff] = useState<Takeoff | null>(null);
   const [loading, setLoading] = useState(true);
@@ -51,7 +51,7 @@ export function TakeoffDetailScreen({
 
   // For subs viewing a delegated takeoff, they won't own the plan —
   // fall back to the Claude-generated project name from the takeoff data.
-  const planName = plan?.file_name ?? takeoff?.data.projectName ?? 'Plan';
+  const planName = plan ? planDisplayName(plan) : takeoff?.data.projectName ?? 'Plan';
 
   // Determine if this is a sub view so Back navigates correctly.
   const mySubIdSet = new Set(mySubIds);
@@ -65,7 +65,11 @@ export function TakeoffDetailScreen({
     <section className="mt-10 w-full">
       <button
         type="button"
-        onClick={() => (isSubView ? navigate('/my-work') : navigate(-1))}
+        onClick={() =>
+          isSubView
+            ? navigate('/my-work')
+            : navigate(planId ? `/projects/${planId}` : '/projects')
+        }
         className="flex items-center gap-1.5 text-sm font-medium text-slate-500 transition-colors hover:text-slate-800"
       >
         <svg

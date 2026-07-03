@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { contractorQuestionnaire } from '@bid-wise/data';
-import { generateTakeoff, performTakeoffs, cancelTakeoff, cancelAllActiveTakeoffs, getActiveTakeoffJob, getActiveTakeoffJobs, getFinalizedTakeoffForPlan, unfinalizeBid, subscribeTakeoffJob, subscribeUserTakeoffJobs, TakeoffCanceledError, type HousePlan, type PricingMatrix, type Takeoff, type TakeoffPhase, type TakeoffJob } from '../lib/supabase';
+import { generateTakeoff, performTakeoffs, cancelTakeoff, cancelAllActiveTakeoffs, getActiveTakeoffJob, getActiveTakeoffJobs, getFinalizedTakeoffForPlan, planDisplayName, unfinalizeBid, subscribeTakeoffJob, subscribeUserTakeoffJobs, TakeoffCanceledError, type HousePlan, type PricingMatrix, type Takeoff, type TakeoffPhase, type TakeoffJob } from '../lib/supabase';
 import { TakeoffView } from './takeoff-view';
 
 const { questions, results, start } = contractorQuestionnaire;
@@ -709,7 +709,7 @@ type LockState =
 export function QuestionnaireForPlan({ plans = [], pricingMatrix, trades }: { plans?: HousePlan[]; pricingMatrix?: PricingMatrix; trades?: string[] }) {
   const { planId } = useParams<{ planId: string }>();
   const plan = plans.find((p) => p.id === planId);
-  const planName = plan ? plan.file_name.replace(/\.[^.]+$/, '') : undefined;
+  const planName = plan ? planDisplayName(plan) : undefined;
 
   // A finalized (or sent) bid locks the project from new takeoffs — gate on it before
   // rendering the questionnaire.

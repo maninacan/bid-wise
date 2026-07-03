@@ -41,6 +41,8 @@ export async function signOut(): Promise<void> {
 export interface HousePlan {
   id: string;
   file_name: string;
+  /** User-editable display name; falls back to the file name when null. */
+  name: string | null;
   storage_path: string;
   file_size: number;
   content_type: string | null;
@@ -50,10 +52,70 @@ export interface HousePlan {
 export async function listHousePlans(): Promise<HousePlan[]> {
   const { data, error } = await supabase
     .from('house_plans')
-    .select('id, file_name, storage_path, file_size, content_type, created_at')
+    .select('id, file_name, name, storage_path, file_size, content_type, created_at')
     .order('created_at', { ascending: true });
   if (error) throw error;
   return data ?? [];
+}
+
+/** Display name for a project: the user-set name, else the file name without extension. */
+export function planDisplayName(plan: Pick<HousePlan, 'name' | 'file_name'>): string {
+  return plan.name?.trim() || plan.file_name.replace(/\.[^.]+$/, '');
+}
+
+/** Renames a project. An empty name clears it (reverts to the file name). Returns the row. */
+export async function renamePlan(planId: string, name: string): Promise<HousePlan> {
+  const { data, error } = await supabase
+    .from('house_plans')
+    .update({ name: name.trim() || null })
+    .eq('id', planId)
+    .select('id, file_name, name, storage_path, file_size, content_type, created_at')
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/** Renames a takeoff (its `data.projectName`). Returns the updated takeoff data. */
+export async function renameTakeoff(takeoffId: string, name: string): Promise<TakeoffData> {
+  const { data: row, error: fetchError } = await supabase
+    .from('takeoffs')
+    .select('data')
+    .eq('id', takeoffId)
+    .single();
+  if (fetchError || !row) throw fetchError ?? new Error('Takeoff not found');
+  const updatedData: TakeoffData = { ...(row.data as TakeoffData), projectName: name.trim() };
+
+  const { data: saved, error } = await supabase
+    .from('takeoffs')
+    .update({ data: updatedData })
+    .eq('id', takeoffId)
+    .select('data')
+    .single();
+  if (error) throw error;
+  if (!saved) throw new Error('Rename returned no data');
+  return saved.data as TakeoffData;
+}
+
+/** Material + labor components of a unit price. Installed unit price = material + labor. */
+export interface PriceParts {
+  material: number;
+  labor: number;
+}
+
+/** A stored price: the structured pair, or a legacy scalar (treated as all-material). */
+export type PriceValue = number | PriceParts;
+
+/** Coerce any stored price into a {material, labor} pair (legacy number → all material). */
+export function priceParts(v: PriceValue | null | undefined): PriceParts {
+  if (v == null) return { material: 0, labor: 0 };
+  if (typeof v === 'number') return { material: v, labor: 0 };
+  return { material: v.material ?? 0, labor: v.labor ?? 0 };
+}
+
+/** Installed unit price (material + labor) for any stored price. */
+export function priceTotal(v: PriceValue | null | undefined): number {
+  const p = priceParts(v);
+  return p.material + p.labor;
 }
 
 export interface TakeoffItem {
@@ -69,29 +131,37 @@ export interface TakeoffSection {
   items: TakeoffItem[];
 }
 
+/** A line item added by the user on the Pricing tab (not produced by the AI takeoff). */
+export interface CustomLineItem {
+  trade: string;
+  description: string;
+  unit: string;
+  quantity: number;
+}
+
 export interface DelegationData {
   subId: string;
   /** Effective unit price used in the GC's bid (manual override if set, else AI) */
-  prices: Record<string, number>;
+  prices: Record<string, PriceValue>;
   /** AI-fetched unit prices — separate from manual overrides */
-  aiPrices?: Record<string, number>;
+  aiPrices?: Record<string, PriceValue>;
   /** Explicit manual overrides entered by the sub */
-  manualPrices?: Record<string, number>;
+  manualPrices?: Record<string, PriceValue>;
   /** ISO timestamp when the sub formally approved their bid */
   approvedAt?: string;
 }
 
 export interface SubDelegationUpdate {
-  prices: Record<string, number>;
-  aiPrices?: Record<string, number>;
-  manualPrices?: Record<string, number>;
+  prices: Record<string, PriceValue>;
+  aiPrices?: Record<string, PriceValue>;
+  manualPrices?: Record<string, PriceValue>;
 }
 
 export interface BidData {
-  /** key: `${trade}::${description}` → unit price */
-  prices: Record<string, number>;
+  /** key: `${trade}::${description}` → unit price (material + labor) */
+  prices: Record<string, PriceValue>;
   /** Prices that came from AI — used to distinguish them from manual overrides on reload */
-  aiPrices?: Record<string, number>;
+  aiPrices?: Record<string, PriceValue>;
   /** ISO timestamp of when AI prices were last fetched */
   aiPricesUpdatedAt?: string;
   /** ZIP code used for the last AI pricing fetch */
@@ -100,6 +170,12 @@ export interface BidData {
   delegations?: Record<string, DelegationData>;
   /** Trades excluded from this bid — their subtotals are dropped from the grand total. */
   excludedTrades?: string[];
+  /** Individual line items (`${trade}::${description}`) struck out on the Pricing tab —
+   *  dropped from totals and hidden from the Bid tab and the shared PDF. */
+  excludedItems?: string[];
+  /** User-added line items, kept separate from the AI-generated takeoff sections so the
+   *  original can always be reverted to. Merged into pricing, the bid, and the PDF. */
+  customItems?: CustomLineItem[];
   overheadPct: number;
   profitPct: number;
   contingencyPct: number;
@@ -195,6 +271,21 @@ export async function listTakeoffTokenUsage(
   );
 }
 
+/** Returns a map of plan_id → total_tokens from the plan_token_usage view. */
+export async function listPlanTokenUsage(
+  planIds: string[],
+): Promise<Record<string, number>> {
+  if (planIds.length === 0) return {};
+  const { data, error } = await supabase
+    .from('plan_token_usage')
+    .select('plan_id, total_tokens')
+    .in('plan_id', planIds);
+  if (error) throw error;
+  return Object.fromEntries(
+    (data ?? []).map((row) => [row.plan_id as string, row.total_tokens as number]),
+  );
+}
+
 export async function getTakeoff(id: string): Promise<Takeoff> {
   const { data, error } = await supabase
     .from('takeoffs')
@@ -255,6 +346,15 @@ function gqlErrorMessage(error: unknown, fallback: string): string {
     if (e.message) return map(e.message);
   }
   return fallback;
+}
+
+/** Pulls the `extensions` object off the first GraphQL error (e.g. for an error code). */
+function gqlExtensions(error: unknown): Record<string, unknown> | undefined {
+  if (error && typeof error === 'object') {
+    const e = error as { graphQLErrors?: { extensions?: Record<string, unknown> }[] };
+    return e.graphQLErrors?.[0]?.extensions;
+  }
+  return undefined;
 }
 
 /** Authorization header carrying the current Supabase access token, for GraphQL calls. */
@@ -583,31 +683,48 @@ export async function saveBid(
   return saved.data as TakeoffData;
 }
 
-/** Stamps finalizedAt on the bid, locking it from further edits. */
+const FINALIZE_BID = gql`
+  mutation FinalizeBid($takeoffId: ID!) {
+    finalizeBid(takeoffId: $takeoffId) {
+      data
+      balanceCents
+    }
+  }
+`;
+
+/** Thrown by finalizeBid when the user's credit balance can't cover the bid's tier price. */
+export class InsufficientCreditsError extends Error {
+  constructor(
+    readonly tier: string,
+    readonly priceCents: number,
+    readonly balanceCents: number,
+  ) {
+    super('Not enough credits to finalize this bid.');
+    this.name = 'InsufficientCreditsError';
+  }
+}
+
+/** Charges the bid's tier price against the user's credits (once per bid) and stamps
+ *  finalizedAt server-side. Throws InsufficientCreditsError if the balance is too low. */
 export async function finalizeBid(takeoffId: string): Promise<TakeoffData> {
-  const { data: row, error: fetchError } = await supabase
-    .from('takeoffs')
-    .select('data')
-    .eq('id', takeoffId)
-    .single();
-  if (fetchError || !row) throw fetchError ?? new Error('Takeoff not found');
-
-  const existing = row.data as TakeoffData;
-  const updatedData: TakeoffData = {
-    ...existing,
-    bid: { ...existing.bid!, finalizedAt: new Date().toISOString() },
-  };
-
-  const { data: saved, error } = await supabase
-    .from('takeoffs')
-    .update({ data: updatedData })
-    .eq('id', takeoffId)
-    .select('data')
-    .single();
-  if (error) throw error;
-  if (!saved) throw new Error('Finalize returned no data');
-
-  return saved.data as TakeoffData;
+  try {
+    const { data } = await apolloClient.mutate<{ finalizeBid: { data: TakeoffData; balanceCents: number } }>({
+      mutation: FINALIZE_BID,
+      variables: { takeoffId },
+      context: await authContext(),
+    });
+    return data!.finalizeBid.data;
+  } catch (error) {
+    const ext = gqlExtensions(error);
+    if (ext?.code === 'INSUFFICIENT_CREDITS') {
+      throw new InsufficientCreditsError(
+        String(ext.tier),
+        Number(ext.priceCents),
+        Number(ext.balanceCents),
+      );
+    }
+    throw new Error(gqlErrorMessage(error, 'Finalize failed.'));
+  }
 }
 
 /** Clears finalizedAt, reopening a finalized bid for edits. Refuses once the bid has
@@ -663,6 +780,95 @@ export async function shareBidPdf(
     });
   } catch (error) {
     throw new Error(gqlErrorMessage(error, 'Share failed.'));
+  }
+}
+
+// ── Billing / credits ─────────────────────────────────────────────────────────
+
+export interface BidQuote {
+  tier: string;
+  priceCents: number;
+  alreadyPaid: boolean;
+  balanceCents: number;
+}
+
+/** Current prepaid credit balance (cents). RLS scopes the view to the current user. */
+export async function getCreditBalanceCents(): Promise<number> {
+  const { data, error } = await supabase
+    .from('user_credit_balance')
+    .select('balance_cents')
+    .maybeSingle();
+  if (error) throw error;
+  return (data?.balance_cents as number) ?? 0;
+}
+
+const BID_QUOTE = gql`
+  query BidQuote($takeoffId: ID!) {
+    bidQuote(takeoffId: $takeoffId) {
+      tier
+      priceCents
+      alreadyPaid
+      balanceCents
+    }
+  }
+`;
+
+/** Tier, price, paid-status and balance for a bid — drives the finalize confirmation UI. */
+export async function bidQuote(takeoffId: string): Promise<BidQuote> {
+  try {
+    const { data } = await apolloClient.query<{ bidQuote: BidQuote }>({
+      query: BID_QUOTE,
+      variables: { takeoffId },
+      context: await authContext(),
+      fetchPolicy: 'network-only',
+    });
+    return data!.bidQuote;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not load bid pricing.'));
+  }
+}
+
+const CREATE_CREDIT_CHECKOUT = gql`
+  mutation CreateCreditCheckout($amountCents: Int!) {
+    createCreditCheckout(amountCents: $amountCents) {
+      url
+    }
+  }
+`;
+
+/** Creates a Stripe Checkout session for a credit top-up; returns the hosted URL to redirect to. */
+export async function createCreditCheckout(amountCents: number): Promise<string> {
+  try {
+    const { data } = await apolloClient.mutate<{ createCreditCheckout: { url: string } }>({
+      mutation: CREATE_CREDIT_CHECKOUT,
+      variables: { amountCents },
+      context: await authContext(),
+    });
+    return data!.createCreditCheckout.url;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not start checkout.'));
+  }
+}
+
+const CONFIRM_TOPUP = gql`
+  mutation ConfirmTopup($sessionId: String!) {
+    confirmTopup(sessionId: $sessionId) {
+      balanceCents
+    }
+  }
+`;
+
+/** Confirms a returned Checkout session and credits the balance (idempotent). Returns the new balance. */
+export async function confirmTopup(sessionId: string): Promise<number> {
+  try {
+    const { data } = await apolloClient.mutate<{ confirmTopup: { balanceCents: number } }>({
+      mutation: CONFIRM_TOPUP,
+      variables: { sessionId },
+      context: await authContext(),
+    });
+    return data!.confirmTopup.balanceCents;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not confirm payment.'));
   }
 }
 
@@ -727,18 +933,28 @@ export interface LocalPricingItem {
 
 const GET_LOCAL_PRICING = gql`
   mutation GetLocalPricing($zipCode: String!, $lineItems: [LocalPricingItemInput!]!, $takeoffId: ID) {
-    getLocalPricing(zipCode: $zipCode, lineItems: $lineItems, takeoffId: $takeoffId)
+    getLocalPricing(zipCode: $zipCode, lineItems: $lineItems, takeoffId: $takeoffId) {
+      prices
+      totalTokens
+    }
   }
 `;
 
-/** Estimates local unit prices via GraphQL. Returns a bidKey → unit price map. */
+export interface LocalPricingResult {
+  /** bidKey → { material, labor } unit price map */
+  prices: Record<string, PriceParts>;
+  /** Total tokens consumed by the request (input + output + cache) */
+  totalTokens: number;
+}
+
+/** Estimates local unit prices via GraphQL. Returns the price map plus token usage. */
 export async function getLocalPricing(
   zipCode: string,
   lineItems: LocalPricingItem[],
   takeoffId?: string,
-): Promise<Record<string, number>> {
+): Promise<LocalPricingResult> {
   try {
-    const { data } = await apolloClient.mutate<{ getLocalPricing: Record<string, number> }>({
+    const { data } = await apolloClient.mutate<{ getLocalPricing: LocalPricingResult }>({
       mutation: GET_LOCAL_PRICING,
       variables: { zipCode, lineItems, takeoffId },
       context: await authContext(),
@@ -793,7 +1009,7 @@ export async function uploadHousePlan(
       file_size: file.size,
       content_type: file.type || null,
     })
-    .select('id, file_name, storage_path, file_size, content_type, created_at')
+    .select('id, file_name, name, storage_path, file_size, content_type, created_at')
     .single();
   if (insertError) throw insertError;
   return data;

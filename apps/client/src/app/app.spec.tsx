@@ -119,6 +119,7 @@ describe('App', () => {
       {
         id: 'plan-0',
         file_name: 'site-plan.pdf',
+        name: null,
         storage_path: 'user-1/site-plan.pdf',
         file_size: 4096,
         content_type: 'application/pdf',
@@ -137,6 +138,7 @@ describe('App', () => {
       {
         id: 'plan-0',
         file_name: 'site-plan.pdf',
+        name: null,
         storage_path: 'user-1/site-plan.pdf',
         file_size: 4096,
         content_type: 'application/pdf',

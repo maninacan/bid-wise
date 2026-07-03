@@ -3,9 +3,14 @@ import GraphQLJSON from 'graphql-type-json';
 import { getAnthropic, CLAUDE_MODEL } from '../lib/anthropic';
 import { trackUsage } from '../track-usage';
 import { generateBidPdf, type BidTakeoffData } from '../bid-pdf';
+import { getStripe, appUrl } from '../lib/stripe';
+import { tierFor, priceCentsFor } from '../lib/pricing';
+import { getBalanceCents, takeoffTokens, creditTopup } from '../billing';
 import { requireUser, type GqlContext } from './context';
 
 const bad = (message: string) => new GraphQLError(message, { extensions: { code: 'BAD_REQUEST' } });
+
+const UNIQUE_VIOLATION = '23505';
 
 // ── clarifyTakeoff ──────────────────────────────────────────────────────────
 async function clarifyTakeoff(
@@ -108,7 +113,7 @@ async function getLocalPricing(
   _: unknown,
   args: { zipCode: string; lineItems: { trade: string; description: string; unit: string }[]; takeoffId?: string },
   ctx: GqlContext,
-): Promise<Record<string, number>> {
+): Promise<{ prices: Record<string, { material: number; labor: number }>; totalTokens: number }> {
   const user = await requireUser(ctx);
   const { zipCode, lineItems, takeoffId } = args;
   if (!zipCode?.trim()) throw bad('zipCode is required.');
@@ -127,7 +132,7 @@ async function getLocalPricing(
     tools: [
       {
         name: 'submit_pricing',
-        description: 'Submit estimated installed unit prices for each line item.',
+        description: 'Submit estimated material and labor unit costs for each line item.',
         input_schema: {
           type: 'object' as const,
           properties: {
@@ -138,9 +143,10 @@ async function getLocalPricing(
                 properties: {
                   trade: { type: 'string' },
                   description: { type: 'string' },
-                  unitPrice: { type: 'number', description: 'Estimated installed price in USD' },
+                  materialPrice: { type: 'number', description: 'Estimated material/supply cost per unit, in USD' },
+                  laborPrice: { type: 'number', description: 'Estimated installed labor cost per unit, in USD' },
                 },
-                required: ['trade', 'description', 'unitPrice'],
+                required: ['trade', 'description', 'materialPrice', 'laborPrice'],
                 additionalProperties: false,
               },
             },
@@ -156,14 +162,17 @@ async function getLocalPricing(
         role: 'user',
         content: `You are a professional construction cost estimator with deep knowledge of regional labor and material markets across the United States.
 
-Estimate current (2025) market unit prices for the following construction line items in the region near ZIP code ${zipCode}. Prices should be installed costs (labor + materials combined) at the subcontractor level — what a general contractor would realistically pay.
+Estimate current (2025) market unit costs for the following construction line items in the region near ZIP code ${zipCode}, at the subcontractor level — what a general contractor would realistically pay. For each item give TWO separate numbers:
+- materialPrice: the supplied material cost per unit (the materials/goods only).
+- laborPrice: the installed labor cost per unit (crew labor including labor burden and typical equipment to install it).
+The installed price is material + labor; keep the two components separate.
 
-Adjust for local cost-of-living, union vs. open-shop norms, and regional material availability. Be specific to the geography: coastal metros cost more, rural areas cost less. Do not use national averages.
+Adjust for local cost-of-living, union vs. open-shop norms, and regional material availability. Be specific to the geography: coastal metros cost more, rural areas cost less. Do not use national averages. For pure-labor items use materialPrice 0; for material-only allowances use laborPrice 0.
 
 Line items to price:
 ${lineItems.map((item, i) => `${i + 1}. [${item.trade}] ${item.description} (per ${item.unit})`).join('\n')}
 
-Use the submit_pricing tool to return your estimates. Return a price for every item.`,
+Use the submit_pricing tool to return your estimates. Return both numbers for every item.`,
       },
     ],
   });
@@ -176,9 +185,14 @@ Use the submit_pricing tool to return your estimates. Return a price for every i
   if (!toolBlock || toolBlock.type !== 'tool_use') throw new GraphQLError('No pricing was produced.');
 
   const { prices } = toolBlock.input as {
-    prices: Array<{ trade: string; description: string; unitPrice: number }>;
+    prices: Array<{ trade: string; description: string; materialPrice: number; laborPrice: number }>;
   };
   if (!Array.isArray(prices)) throw new GraphQLError('Model returned malformed pricing data.');
+
+  const cacheCreation = message.usage.cache_creation_input_tokens ?? 0;
+  const cacheRead = message.usage.cache_read_input_tokens ?? 0;
+  const totalTokens =
+    message.usage.input_tokens + message.usage.output_tokens + cacheCreation + cacheRead;
 
   await trackUsage(ctx.supabase, {
     user_id: user.id,
@@ -188,8 +202,8 @@ Use the submit_pricing tool to return your estimates. Return a price for every i
     model: CLAUDE_MODEL,
     input_tokens: message.usage.input_tokens,
     output_tokens: message.usage.output_tokens,
-    cache_creation_input_tokens: message.usage.cache_creation_input_tokens ?? 0,
-    cache_read_input_tokens: message.usage.cache_read_input_tokens ?? 0,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
   });
 
   // Map to bidKey -> price using a case-insensitive lookup from the original line_items
@@ -197,16 +211,19 @@ Use the submit_pricing tool to return your estimates. Return a price for every i
   const itemByDesc = new Map<string, { trade: string; description: string }>();
   for (const item of lineItems) itemByDesc.set(item.description.toLowerCase(), item);
 
-  const result: Record<string, number> = {};
+  const result: Record<string, { material: number; labor: number }> = {};
   for (const p of prices) {
     const desc = p.description.replace(/ \(per [^)]+\)$/, '');
     const original = itemByDesc.get(desc.toLowerCase());
     const trade = original?.trade ?? p.trade;
     const description = original?.description ?? desc;
-    result[`${trade}::${description}`] = p.unitPrice;
+    result[`${trade}::${description}`] = {
+      material: p.materialPrice ?? 0,
+      labor: p.laborPrice ?? 0,
+    };
   }
 
-  return result;
+  return { prices: result, totalTokens };
 }
 
 // ── saveSubPrices ───────────────────────────────────────────────────────────
@@ -429,10 +446,157 @@ async function shareBidPdf(
   return { ok: true };
 }
 
+// ── Billing / credits ────────────────────────────────────────────────────────
+
+const MIN_TOPUP_CENTS = 500; // $5
+const MAX_TOPUP_CENTS = 100_000; // $1,000
+
+async function creditBalanceCents(_: unknown, __: unknown, ctx: GqlContext): Promise<number> {
+  const user = await requireUser(ctx);
+  return getBalanceCents(ctx.supabase, user.id);
+}
+
+async function bidQuote(
+  _: unknown,
+  { takeoffId }: { takeoffId: string },
+  ctx: GqlContext,
+): Promise<{ tier: string; priceCents: number; alreadyPaid: boolean; balanceCents: number }> {
+  const user = await requireUser(ctx);
+  const { data: takeoff } = await ctx.supabase
+    .from('takeoffs')
+    .select('id')
+    .eq('id', takeoffId)
+    .eq('user_id', user.id)
+    .maybeSingle();
+  if (!takeoff) throw bad('Takeoff not found.');
+
+  const tokens = await takeoffTokens(ctx.supabase, takeoffId);
+  const { data: existingCharge } = await ctx.supabase
+    .from('credit_transactions')
+    .select('id')
+    .eq('takeoff_id', takeoffId)
+    .eq('kind', 'charge')
+    .maybeSingle();
+
+  return {
+    tier: tierFor(tokens),
+    priceCents: priceCentsFor(tokens),
+    alreadyPaid: !!existingCharge,
+    balanceCents: await getBalanceCents(ctx.supabase, user.id),
+  };
+}
+
+async function createCreditCheckout(
+  _: unknown,
+  { amountCents }: { amountCents: number },
+  ctx: GqlContext,
+): Promise<{ url: string }> {
+  const user = await requireUser(ctx);
+  if (!Number.isInteger(amountCents) || amountCents < MIN_TOPUP_CENTS || amountCents > MAX_TOPUP_CENTS) {
+    throw bad(`Top-up must be between $${MIN_TOPUP_CENTS / 100} and $${MAX_TOPUP_CENTS / 100}.`);
+  }
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'payment',
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: amountCents,
+          product_data: { name: 'Bid Wise credits' },
+        },
+      },
+    ],
+    metadata: { userId: user.id, kind: 'credit_topup' },
+    success_url: `${appUrl()}/billing?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${appUrl()}/billing?canceled=1`,
+  });
+  if (!session.url) throw new GraphQLError('Stripe did not return a checkout URL.');
+  return { url: session.url };
+}
+
+async function confirmTopup(
+  _: unknown,
+  { sessionId }: { sessionId: string },
+  ctx: GqlContext,
+): Promise<{ balanceCents: number }> {
+  const user = await requireUser(ctx);
+  const session = await getStripe().checkout.sessions.retrieve(sessionId);
+  if (session.payment_status === 'paid' && session.metadata?.userId === user.id) {
+    await creditTopup(ctx.supabase, {
+      userId: user.id,
+      sessionId: session.id,
+      amountCents: session.amount_total ?? 0,
+    });
+  }
+  return { balanceCents: await getBalanceCents(ctx.supabase, user.id) };
+}
+
+async function finalizeBid(
+  _: unknown,
+  { takeoffId }: { takeoffId: string },
+  ctx: GqlContext,
+): Promise<{ data: unknown; balanceCents: number }> {
+  const user = await requireUser(ctx);
+
+  const { data: takeoff } = await ctx.supabase
+    .from('takeoffs')
+    .select('data')
+    .eq('id', takeoffId)
+    .eq('user_id', user.id)
+    .maybeSingle();
+  if (!takeoff) throw bad('Takeoff not found.');
+
+  const data = takeoff.data as { bid?: { finalizedAt?: string } };
+  if (!data.bid) throw bad('Add pricing before finalizing.');
+
+  // Charge once per bid. If a charge already exists, re-finalizing is free.
+  const { data: existingCharge } = await ctx.supabase
+    .from('credit_transactions')
+    .select('id')
+    .eq('takeoff_id', takeoffId)
+    .eq('kind', 'charge')
+    .maybeSingle();
+
+  if (!existingCharge) {
+    const tokens = await takeoffTokens(ctx.supabase, takeoffId);
+    const tier = tierFor(tokens);
+    const priceCents = priceCentsFor(tokens);
+    const balance = await getBalanceCents(ctx.supabase, user.id);
+    if (balance < priceCents) {
+      throw new GraphQLError('Not enough credits to finalize this bid.', {
+        extensions: { code: 'INSUFFICIENT_CREDITS', tier, priceCents, balanceCents: balance },
+      });
+    }
+    const { error: chargeErr } = await ctx.supabase.from('credit_transactions').insert({
+      user_id: user.id,
+      kind: 'charge',
+      amount_cents: -priceCents,
+      takeoff_id: takeoffId,
+      tier,
+    });
+    // Unique violation → a concurrent finalize already charged it; proceed to stamp.
+    if (chargeErr && (chargeErr as { code?: string }).code !== UNIQUE_VIOLATION) throw chargeErr;
+  }
+
+  data.bid.finalizedAt = new Date().toISOString();
+  const { data: saved, error } = await ctx.supabase
+    .from('takeoffs')
+    .update({ data })
+    .eq('id', takeoffId)
+    .select('data')
+    .single();
+  if (error || !saved) throw new GraphQLError('Finalize failed to save.');
+
+  return { data: saved.data, balanceCents: await getBalanceCents(ctx.supabase, user.id) };
+}
+
 export const resolvers = {
   JSON: GraphQLJSON,
   Query: {
     hello: () => 'Hello from Apollo Server!',
+    creditBalanceCents,
+    bidQuote,
   },
   Mutation: {
     clarifyTakeoff,
@@ -440,5 +604,8 @@ export const resolvers = {
     saveSubPrices,
     approveSubBid,
     shareBidPdf,
+    createCreditCheckout,
+    confirmTopup,
+    finalizeBid,
   },
 };

@@ -26,6 +26,7 @@ import { SubsScreen } from './subs-screen';
 import { SubLinkNoticeModal } from './sub-link-notice-modal';
 import { MyWorkScreen } from './my-work-screen';
 import { TradesOnboardingModal } from './trades-onboarding-modal';
+import { BillingScreen, CreditsChip } from './billing-screen';
 
 const DEFAULT_SETTINGS: UserSettings = {
   pricingMatrix: { unitDefaults: {}, tradeOverrides: [] },
@@ -141,6 +142,7 @@ export function App() {
             >
               Subs
             </button>
+            <CreditsChip />
             <button
               type="button"
               onClick={() => setSettingsOpen(true)}
@@ -191,7 +193,14 @@ export function App() {
 
             <Route
               path="/projects"
-              element={<ProjectsScreen plans={existingPlans} />}
+              element={
+                <ProjectsScreen
+                  plans={existingPlans}
+                  onPlanRenamed={(updated) =>
+                    setExistingPlans((prev) => prev.map((p) => (p.id === updated.id ? updated : p)))
+                  }
+                />
+              }
             />
 
             <Route
@@ -238,6 +247,8 @@ export function App() {
             />
 
             <Route path="/my-work" element={<MyWorkScreen />} />
+
+            <Route path="/billing" element={<BillingScreen />} />
 
             <Route path="*" element={<Navigate to="/projects" replace />} />
           </Routes>

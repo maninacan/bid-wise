@@ -1,0 +1,132 @@
+name: Deploy to Fly.io
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: 'Deploy all apps regardless of changes'
+        type: boolean
+        default: false
+
+concurrency:
+  group: fly-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Detect which apps changed so we only rebuild/redeploy what's affected.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.detect.outputs.api }}
+      client: ${{ steps.detect.outputs.client }}
+      marketing: ${{ steps.detect.outputs.marketing }}
+      super-admin-portal: ${{ steps.detect.outputs.super-admin-portal }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+      - run: npm ci --no-audit --no-fund
+
+      # Sets NX_BASE / NX_HEAD for `nx affected`.
+      - uses: nrwl/nx-set-shas@v4
+
+      - id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORCE="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.deploy_all }}" = "true" ]; then FORCE="true"; fi
+          if git log -1 --pretty=%B | grep -qF '[deploy all]'; then FORCE="true"; fi
+
+          AFFECTED="$(npx nx show projects --affected --base="$NX_BASE" --head="$NX_HEAD" 2>/dev/null || echo '')"
+          echo "Affected projects: $AFFECTED"
+
+          # Shared files that force every app to redeploy.
+          SHARED_CHANGED="false"
+          if git diff --name-only "$NX_BASE" "$NX_HEAD" | grep -qE '^(package-lock\.json|package\.json|nginx\.conf|marketing-nginx\.conf|\.dockerignore|libs/)'; then
+            SHARED_CHANGED="true"
+          fi
+
+          emit () { # $1 = app name, $2 = its Dockerfile, $3 = its fly config
+            local app="$1" dockerfile="$2" cfg="$3" changed="false"
+            if [ "$FORCE" = "true" ] || [ "$SHARED_CHANGED" = "true" ]; then changed="true"; fi
+            if echo "$AFFECTED" | grep -qx "$app"; then changed="true"; fi
+            if git diff --name-only "$NX_BASE" "$NX_HEAD" | grep -qxE "($dockerfile|$cfg)"; then changed="true"; fi
+            echo "$app=$changed" >> "$GITHUB_OUTPUT"
+            echo "$app -> $changed"
+          }
+
+          emit api                Dockerfile                     fly-api.toml
+          emit client             client.Dockerfile              fly-client.toml
+          emit marketing          marketing.Dockerfile           fly-marketing.toml
+          emit super-admin-portal super-admin-portal.Dockerfile  fly-super-admin-portal.toml
+
+  deploy-api:
+    needs: changes
+    if: needs.changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-bidwise-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only --config fly-api.toml --dockerfile Dockerfile
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-client:
+    needs: changes
+    if: needs.changes.outputs.client == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-bidwise-client
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: |
+          flyctl deploy --remote-only --config fly-client.toml --dockerfile client.Dockerfile \
+            --build-arg VITE_GRAPHQL_URL="${{ secrets.VITE_GRAPHQL_URL }}" \
+            --build-arg VITE_API_URL="${{ secrets.VITE_API_URL }}" \
+            --build-arg VITE_SUPABASE_URL="${{ secrets.VITE_SUPABASE_URL }}" \
+            --build-arg VITE_SUPABASE_PUBLISHABLE_KEY="${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-super-admin-portal:
+    needs: changes
+    if: needs.changes.outputs.super-admin-portal == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-bidwise-super-admin-portal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: |
+          flyctl deploy --remote-only --config fly-super-admin-portal.toml --dockerfile super-admin-portal.Dockerfile \
+            --build-arg VITE_GRAPHQL_URL="${{ secrets.VITE_GRAPHQL_URL }}" \
+            --build-arg VITE_API_URL="${{ secrets.VITE_API_URL }}" \
+            --build-arg VITE_SUPABASE_URL="${{ secrets.VITE_SUPABASE_URL }}" \
+            --build-arg VITE_SUPABASE_PUBLISHABLE_KEY="${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-marketing:
+    needs: changes
+    if: needs.changes.outputs.marketing == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-bidwise-marketing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only --config fly-marketing.toml --dockerfile marketing.Dockerfile
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

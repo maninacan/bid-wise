@@ -5,10 +5,13 @@ import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 interface TakeoffItem { description: string; quantity: number; unit: string; }
 interface TakeoffSection { trade: string; items: TakeoffItem[]; }
 interface DelegationData { subId: string; prices: Record<string, number>; approvedAt?: string; }
+interface CustomLineItem { trade: string; description: string; unit: string; quantity: number; }
 interface BidData {
   prices: Record<string, number>;
   delegations?: Record<string, DelegationData>;
   excludedTrades?: string[];
+  excludedItems?: string[];
+  customItems?: CustomLineItem[];
   overheadPct: number;
   profitPct: number;
   contingencyPct: number;
@@ -19,6 +22,13 @@ export interface BidTakeoffData { projectName: string; sections: TakeoffSection[
 
 function fmtMoney(n: number): string {
   return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/** Coerce a stored price (legacy scalar or {material, labor}) into a parts pair. */
+function priceParts(v: number | { material?: number; labor?: number } | undefined | null): { material: number; labor: number } {
+  if (v == null) return { material: 0, labor: 0 };
+  if (typeof v === 'number') return { material: v, labor: 0 };
+  return { material: v.material ?? 0, labor: v.labor ?? 0 };
 }
 
 export async function generateBidPdf(
@@ -85,12 +95,13 @@ export async function generateBidPdf(
   y -= 20;
 
   // ── Column headers ──
-  const COL = { desc: MARGIN, qty: MARGIN + 250, unit: MARGIN + 310, price: MARGIN + 370, total: W - MARGIN - 55 };
+  const COL = { desc: MARGIN, qty: 248, unit: 286, material: 326, labor: 396, total: W - MARGIN - 55 };
   if (sharingMode === 'full') {
     text('DESCRIPTION', COL.desc, y, 7, true, gray);
     text('QTY', COL.qty, y, 7, true, gray);
     text('UNIT', COL.unit, y, 7, true, gray);
-    text('UNIT PRICE', COL.price, y, 7, true, gray);
+    text('MATERIAL', COL.material, y, 7, true, gray);
+    text('LABOR', COL.labor, y, 7, true, gray);
     text('TOTAL', COL.total, y, 7, true, gray);
   } else {
     text('TRADE', COL.desc, y, 7, true, gray);
@@ -103,9 +114,35 @@ export async function generateBidPdf(
   const bid = data.bid!;
   const delegations = bid.delegations ?? {};
   const excludedTrades = new Set(bid.excludedTrades ?? []);
-  // Excluded trades are dropped from the proposal entirely.
-  const sections = data.sections.filter((s) => !excludedTrades.has(s.trade));
+  const excludedItems = new Set(bid.excludedItems ?? []);
+
+  // Merge user-added custom items into the AI sections (appending to a matching trade or
+  // creating a new one) so they appear in the proposal alongside the generated items.
+  const merged: TakeoffSection[] = data.sections.map((s) => ({ ...s, items: [...s.items] }));
+  const byTrade = new Map(merged.map((s) => [s.trade, s]));
+  for (const ci of bid.customItems ?? []) {
+    const item: TakeoffItem = { description: ci.description, quantity: ci.quantity, unit: ci.unit };
+    const existing = byTrade.get(ci.trade);
+    if (existing) existing.items.push(item);
+    else {
+      const ns: TakeoffSection = { trade: ci.trade, items: [item] };
+      merged.push(ns);
+      byTrade.set(ci.trade, ns);
+    }
+  }
+
+  // Excluded trades and struck-out line items are dropped from the proposal entirely;
+  // a section left with no items after filtering is omitted too.
+  const sections = merged
+    .filter((s) => !excludedTrades.has(s.trade))
+    .map((s) => ({
+      ...s,
+      items: s.items.filter((it) => !excludedItems.has(`${s.trade}::${it.description}`)),
+    }))
+    .filter((s) => s.items.length > 0);
   let directCost = 0;
+  let materialDirect = 0;
+  let laborDirect = 0;
 
   const rowLabel = (label: string, value: string, bold = false) => {
     text(label, W - MARGIN - 195, y, 9, bold);
@@ -125,15 +162,20 @@ export async function generateBidPdf(
       for (const item of section.items) {
         checkY(16);
         const key = `${section.trade}::${item.description}`;
-        const unitPrice = del?.prices[key] ?? bid.prices[key] ?? 0;
-        const lineTotal = item.quantity * unitPrice;
+        const parts = priceParts(del?.prices[key] ?? bid.prices[key]);
+        const lineMaterial = item.quantity * parts.material;
+        const lineLabor = item.quantity * parts.labor;
+        const lineTotal = lineMaterial + lineLabor;
         directCost += lineTotal;
+        materialDirect += lineMaterial;
+        laborDirect += lineLabor;
 
-        const desc = item.description.length > 42 ? item.description.slice(0, 40) + '…' : item.description;
+        const desc = item.description.length > 34 ? item.description.slice(0, 32) + '…' : item.description;
         text(desc, COL.desc + 6, y, 8.5);
         text(item.quantity.toLocaleString(), COL.qty, y, 8.5, false, gray);
         text(item.unit, COL.unit, y, 8.5, false, gray);
-        text(unitPrice > 0 ? fmtMoney(unitPrice) : '—', COL.price, y, 8.5, false, gray);
+        text(lineMaterial > 0 ? fmtMoney(lineMaterial) : '—', COL.material, y, 8.5, false, gray);
+        text(lineLabor > 0 ? fmtMoney(lineLabor) : '—', COL.labor, y, 8.5, false, gray);
         text(lineTotal > 0 ? fmtMoney(lineTotal) : '—', COL.total, y, 8.5);
         y -= 15;
       }
@@ -141,7 +183,7 @@ export async function generateBidPdf(
     }
 
     // ── Cost summary (full mode) ──
-    checkY(110);
+    checkY(140);
     y -= 8;
     rule(y, W - MARGIN - 200, W - MARGIN, 1, navy);
     y -= 16;
@@ -151,6 +193,8 @@ export async function generateBidPdf(
     const contingency = directCost * (bid.contingencyPct || 0) / 100;
     const totalBid = directCost + oh + profit + contingency;
 
+    rowLabel('Materials', fmtMoney(materialDirect));
+    rowLabel('Labor', fmtMoney(laborDirect));
     rowLabel('Direct cost', fmtMoney(directCost));
     rowLabel(`Overhead (${bid.overheadPct}%)`, fmtMoney(oh));
     rowLabel(`Profit (${bid.profitPct}%)`, fmtMoney(profit));
@@ -166,15 +210,20 @@ export async function generateBidPdf(
       + (bid.profitPct || 0) / 100
       + (bid.contingencyPct || 0) / 100;
     let totalBid = 0;
+    let materialDirect = 0;
+    let laborDirect = 0;
 
     for (const section of sections) {
       checkY(18);
       const del = delegations[section.trade];
-      const sectionDirect = section.items.reduce((sum, item) => {
+      let sectionDirect = 0;
+      for (const item of section.items) {
         const key = `${section.trade}::${item.description}`;
-        const unitPrice = del?.prices[key] ?? bid.prices[key] ?? 0;
-        return sum + item.quantity * unitPrice;
-      }, 0);
+        const parts = priceParts(del?.prices[key] ?? bid.prices[key]);
+        materialDirect += item.quantity * parts.material;
+        laborDirect += item.quantity * parts.labor;
+        sectionDirect += item.quantity * (parts.material + parts.labor);
+      }
       const sectionLoaded = sectionDirect * markupFactor;
       totalBid += sectionLoaded;
 
@@ -184,9 +233,15 @@ export async function generateBidPdf(
     }
     y -= 4;
 
-    checkY(50);
+    checkY(70);
     y -= 8;
     rule(y, W - MARGIN - 200, W - MARGIN, 1, navy);
+    y -= 16;
+    // Materials/labor shown as the loaded (marked-up) split so the parts sum to the total bid.
+    rowLabel('Materials', fmtMoney(materialDirect * markupFactor));
+    rowLabel('Labor', fmtMoney(laborDirect * markupFactor));
+    y -= 2;
+    rule(y, W - MARGIN - 200, W - MARGIN);
     y -= 14;
     rowLabel('Total bid', fmtMoney(totalBid), true);
   }

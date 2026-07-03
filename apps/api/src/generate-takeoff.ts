@@ -41,6 +41,48 @@ function normalizeUnit(raw: string): string {
   return UNIT_ALIASES[cleaned] ?? String(raw ?? '').trim().toUpperCase();
 }
 
+// Static takeoff instructions — byte-identical on every run, so they live in a cached
+// `system` block (the per-request trade scope is sent separately in the user message).
+const TAKEOFF_INSTRUCTIONS = `You are an experienced construction quantity surveyor and estimator.
+
+Analyze the architectural plans provided and generate a complete quantity takeoff.
+
+As you work through each trade, briefly narrate what you're doing: which sheets you're referencing, how you're deriving quantities, and key assumptions. Keep this commentary tight — a few lines per trade, not paragraphs. Reserve most of your output for the structured tool call.
+
+Each line item must be a concrete, real construction material or installed work item that a subcontractor would price (e.g. "1/2\\" gypsum board", "R-21 batt insulation", "30-year architectural shingles") — never vague placeholders, headings, or duplicates.
+
+CRITICAL — the line items feed a materials list and a priced bid, so duplicates corrupt the totals:
+- Within a trade, list each distinct material exactly ONCE. If the same material appears in several places, consolidate it into a single line with the summed quantity.
+- Do not emit near-duplicate descriptions that refer to the same material (e.g. "2x4 stud" and "2x4 studs", or the same item with different wording). Pick one description per material.
+- Each description within a trade must be unique.
+
+Use the unit of measure each item is conventionally bid in across the industry, as an uppercase abbreviation from this set ONLY:
+- SF — area work: drywall, flooring, paint/coatings, tile, insulation, siding, sheathing
+- SQ — roofing (1 SQ = 100 SF of roof)
+- LF — linear runs: trim/baseboard/casing, pipe, conduit, gutter, footings, framing runs
+- SY — carpet, paving
+- CY — concrete, excavation, gravel, fill
+- CF — loose volume (e.g. some gravel/mulch)
+- EA — discrete units: fixtures, doors, windows, appliances, cabinets, equipment
+- LS — lump sum: general conditions, mobilization, allowances
+- TON — HVAC equipment tonnage, structural steel, asphalt
+- GAL — bulk liquids
+- BF — rough lumber (board feet)
+- PR — pairs
+- HR — hourly labor
+Pick the single most standard unit per item; do not invent other unit strings.
+
+For each line item, classify the source:
+- "stated" — the quantity is explicitly called out on the plans (e.g., a schedule or note gives the count)
+- "derived" — the quantity was calculated from plan dimensions (e.g., area from room footprint)
+- "estimated" — the quantity was estimated based on typical construction practice (e.g., rough-in counts per fixture)
+
+Identify gaps where information is missing or ambiguous — things a contractor would need to clarify before confidently pricing the job.
+
+Also populate "acronyms": list every abbreviation or acronym you used anywhere in this takeoff — every unit of measure, plus any acronyms in line-item descriptions — each paired with its full plain-English meaning (e.g. "MO" → "Month", "GFCI" → "Ground-fault circuit interrupter"). Do not include plain words that aren't abbreviations.
+
+Once your analysis is complete, call submit_takeoff with all the structured results.`;
+
 export async function generateTakeoffHandler(req: Request, res: Response): Promise<void> {
   // NDJSON streaming: one JSON object per line. Disable buffering so chunks reach the
   // client immediately (X-Accel-Buffering defeats nginx proxy buffering if present).
@@ -211,12 +253,16 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
 
     const claudeStream = anthropic.messages.stream({
       model,
-      max_tokens: 32000,
+      max_tokens: 64000,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'high' },
       tool_choice: { type: 'auto' },
       tools: [
         {
           name: 'submit_takeoff',
           description: 'Submit the completed quantity takeoff for this project.',
+          // Static tool schema — cache it as part of the stable request prefix.
+          cache_control: { type: 'ephemeral' },
           input_schema: {
             type: 'object' as const,
             properties: {
@@ -302,6 +348,12 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
           },
         },
       ],
+      // Static instructions in a cached system block; the per-request trade scope and the
+      // (per-plan) PDF go in the user message. Cache breakpoints on the tool, the system
+      // block, and the document let repeat/same-plan generations reuse the prefix.
+      system: [
+        { type: 'text', text: TAKEOFF_INSTRUCTIONS, cache_control: { type: 'ephemeral' } },
+      ],
       messages: [
         {
           role: 'user',
@@ -309,50 +361,11 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
             {
               type: 'document',
               source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 },
+              cache_control: { type: 'ephemeral' },
             },
             {
               type: 'text',
-              text: `You are an experienced construction quantity surveyor and estimator.
-
-Analyze the architectural plans provided and generate a complete quantity takeoff.
-
-${tradesClause}
-
-As you work through each trade, briefly narrate what you're doing: which sheets you're referencing, how you're deriving quantities, and key assumptions. Keep this commentary tight — a few lines per trade, not paragraphs. Reserve most of your output for the structured tool call.
-
-Each line item must be a concrete, real construction material or installed work item that a subcontractor would price (e.g. "1/2\" gypsum board", "R-21 batt insulation", "30-year architectural shingles") — never vague placeholders, headings, or duplicates.
-
-CRITICAL — the line items feed a materials list and a priced bid, so duplicates corrupt the totals:
-- Within a trade, list each distinct material exactly ONCE. If the same material appears in several places, consolidate it into a single line with the summed quantity.
-- Do not emit near-duplicate descriptions that refer to the same material (e.g. "2x4 stud" and "2x4 studs", or the same item with different wording). Pick one description per material.
-- Each description within a trade must be unique.
-
-Use the unit of measure each item is conventionally bid in across the industry, as an uppercase abbreviation from this set ONLY:
-- SF — area work: drywall, flooring, paint/coatings, tile, insulation, siding, sheathing
-- SQ — roofing (1 SQ = 100 SF of roof)
-- LF — linear runs: trim/baseboard/casing, pipe, conduit, gutter, footings, framing runs
-- SY — carpet, paving
-- CY — concrete, excavation, gravel, fill
-- CF — loose volume (e.g. some gravel/mulch)
-- EA — discrete units: fixtures, doors, windows, appliances, cabinets, equipment
-- LS — lump sum: general conditions, mobilization, allowances
-- TON — HVAC equipment tonnage, structural steel, asphalt
-- GAL — bulk liquids
-- BF — rough lumber (board feet)
-- PR — pairs
-- HR — hourly labor
-Pick the single most standard unit per item; do not invent other unit strings.
-
-For each line item, classify the source:
-- "stated" — the quantity is explicitly called out on the plans (e.g., a schedule or note gives the count)
-- "derived" — the quantity was calculated from plan dimensions (e.g., area from room footprint)
-- "estimated" — the quantity was estimated based on typical construction practice (e.g., rough-in counts per fixture)
-
-Identify gaps where information is missing or ambiguous — things a contractor would need to clarify before confidently pricing the job.
-
-Also populate "acronyms": list every abbreviation or acronym you used anywhere in this takeoff — every unit of measure, plus any acronyms in line-item descriptions — each paired with its full plain-English meaning (e.g. "MO" → "Month", "GFCI" → "Ground-fault circuit interrupter"). Do not include plain words that aren't abbreviations.
-
-Once your analysis is complete, call submit_takeoff with all the structured results.`,
+              text: tradesClause,
             },
           ],
         },

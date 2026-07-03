@@ -10,6 +10,9 @@ import {
   getPlanSignedUrl,
   listTakeoffTokenUsage,
   listTakeoffs,
+  planDisplayName,
+  priceTotal,
+  renameTakeoff,
   subscribeTakeoffJob,
 } from '../lib/supabase';
 
@@ -42,19 +45,22 @@ function bidTotal(takeoff: Takeoff): number | null {
   const { bid, sections } = takeoff.data;
   if (!bid) return null;
   const excluded = new Set(bid.excludedTrades ?? []);
+  const excludedItems = new Set(bid.excludedItems ?? []);
+  // Custom items live on the bid (not in the AI sections); count them alongside.
+  const allItems: { trade: string; description: string; quantity: number }[] = [
+    ...sections.flatMap((s) => s.items.map((it) => ({ trade: s.trade, description: it.description, quantity: it.quantity }))),
+    ...(bid.customItems ?? []).map((c) => ({ trade: c.trade, description: c.description, quantity: c.quantity })),
+  ];
   let direct = 0;
-  for (const section of sections) {
-    if (excluded.has(section.trade)) continue;
-    for (const item of section.items) {
-      const key = `${section.trade}::${item.description}`;
-      direct += item.quantity * (bid.prices[key] ?? 0);
-    }
+  for (const item of allItems) {
+    if (excluded.has(item.trade)) continue;
+    const key = `${item.trade}::${item.description}`;
+    if (excludedItems.has(key)) continue;
+    direct += item.quantity * priceTotal(bid.prices[key]);
   }
   const mult = 1 + (bid.overheadPct + bid.profitPct + bid.contingencyPct) / 100;
   return direct * mult;
 }
-
-const projectName = (fileName: string) => fileName.replace(/\.[^.]+$/, '');
 
 // ── 3-dot actions menu ────────────────────────────────────────────────────────
 
@@ -197,6 +203,28 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
   const [deleteTarget, setDeleteTarget] = useState<Takeoff | null>(null);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState<TakeoffJob | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editValue, setEditValue] = useState('');
+  const [savingId, setSavingId] = useState<string | null>(null);
+
+  const startEdit = (takeoff: Takeoff) => {
+    setEditingId(takeoff.id);
+    setEditValue(takeoff.data.projectName);
+  };
+  const saveEdit = async (takeoff: Takeoff) => {
+    const name = editValue.trim();
+    if (!name) return;
+    setSavingId(takeoff.id);
+    try {
+      const updated = await renameTakeoff(takeoff.id, name);
+      setTakeoffs((prev) => prev.map((t) => (t.id === takeoff.id ? { ...t, data: updated } : t)));
+      setEditingId(null);
+    } catch {
+      // leave the editor open on failure
+    } finally {
+      setSavingId(null);
+    }
+  };
 
   const plan = planId ? plans.find((p) => p.id === planId) : null;
 
@@ -289,7 +317,7 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
       )}
       <div className="flex items-center justify-between">
         <h1 className="text-xl font-semibold text-slate-800">
-          {plan ? projectName(plan.file_name) : 'Quantity Takeoffs'}
+          {plan ? planDisplayName(plan) : 'Quantity Takeoffs'}
         </h1>
         <button
           type="button"
@@ -366,19 +394,59 @@ export function TakeoffsScreen({ plans }: TakeoffsScreenProps) {
                     className="cursor-pointer border-b border-slate-100 transition-colors last:border-0 hover:bg-slate-50"
                   >
                     <td className="px-5 py-3.5 font-medium text-slate-800">
-                      <div className="flex items-center gap-2">
-                        <span>{takeoff.data.projectName}</span>
-                        {isFinalized && (
-                          <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-medium text-green-700">
-                            Finalized
-                          </span>
-                        )}
-                        {superseded && (
-                          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-                            Superseded
-                          </span>
-                        )}
-                      </div>
+                      {editingId === takeoff.id ? (
+                        <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            value={editValue}
+                            onChange={(e) => setEditValue(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveEdit(takeoff);
+                              if (e.key === 'Escape') setEditingId(null);
+                            }}
+                            autoFocus
+                            className="w-64 rounded border border-slate-300 px-2 py-1 text-sm font-normal focus:border-blue-400 focus:outline-none"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => saveEdit(takeoff)}
+                            disabled={savingId === takeoff.id || !editValue.trim()}
+                            className="rounded-md bg-blue-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                          >
+                            {savingId === takeoff.id ? 'Saving…' : 'Save'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingId(null)}
+                            className="rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 hover:bg-slate-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <span>{takeoff.data.projectName}</span>
+                          <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); startEdit(takeoff); }}
+                            title="Rename takeoff"
+                            className="rounded p-1 text-slate-300 transition-colors hover:bg-slate-100 hover:text-slate-600"
+                          >
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                              <path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" strokeLinecap="round" strokeLinejoin="round" />
+                            </svg>
+                          </button>
+                          {isFinalized && (
+                            <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-medium text-green-700">
+                              Finalized
+                            </span>
+                          )}
+                          {superseded && (
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+                              Superseded
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="px-5 py-3.5 tabular-nums text-slate-500">
                       {fmtDate(takeoff.created_at)}

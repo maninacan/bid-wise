@@ -8,6 +8,8 @@
       "text": "Select which part of the build process you want to get takeoffs for.",
       "choices": [
         { "label": "General Contractor",         "value": "gc",          "next": "done", "specialAction": { "type": "select-all", "except": [] } },
+        { "label": "Demolition",                 "value": "demolition",  "next": "done" },
+        { "label": "Sitework / Excavation",      "value": "sitework",    "next": "done" },
         { "label": "Plumbing",                   "value": "plumbing",    "next": "done" },
         { "label": "Electrical",                 "value": "electrical",  "next": "done" },
         { "label": "HVAC / Mechanical",          "value": "hvac",        "next": "done" },
@@ -21,7 +23,8 @@
         { "label": "Tile / Stone",               "value": "tile",        "next": "done" },
         { "label": "Cabinetry",                  "value": "cabinetry",   "next": "done" },
         { "label": "Appliances",                 "value": "appliances",  "next": "done" },
-        { "label": "Finish Work",                "value": "finish-work", "next": "done" }
+        { "label": "Finish Work",                "value": "finish-work", "next": "done" },
+        { "label": "Garage Doors",               "value": "garage-doors","next": "done" }
       ],
       "passthrough": "takeoffs"
     }

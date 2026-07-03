@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+.git
+dist
+**/dist
+tmp
+**/tmp
+.nx
+Dockerfile
+*.Dockerfile
+.dockerignore
+fly*.toml
+.github

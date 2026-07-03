@@ -1,27 +1,7 @@
 import { useState } from 'react';
+import { TRADES } from '@bid-wise/data';
 import type { Subcontractor } from '../lib/supabase';
 import { createSubcontractor, deleteSubcontractor, updateSubcontractor } from '../lib/supabase';
-
-// ── Shared trades list (same as settings-panel) ───────────────────────────────
-
-export const TRADES: { value: string; label: string }[] = [
-  { value: 'General Contractor', label: 'General Contractor' },
-  { value: 'Concrete / Masonry', label: 'Concrete / Masonry' },
-  { value: 'Framing / Carpentry', label: 'Framing / Carpentry' },
-  { value: 'Roofing', label: 'Roofing' },
-  { value: 'Drywall / Plastering', label: 'Drywall / Plastering' },
-  { value: 'Painting / Coatings', label: 'Painting / Coatings' },
-  { value: 'Electrical', label: 'Electrical' },
-  { value: 'Plumbing', label: 'Plumbing' },
-  { value: 'HVAC / Mechanical', label: 'HVAC / Mechanical' },
-  { value: 'Flooring', label: 'Flooring' },
-  { value: 'Tile / Stone', label: 'Tile / Stone' },
-  { value: 'Cabinetry', label: 'Cabinetry' },
-  { value: 'Appliances', label: 'Appliances' },
-  { value: 'Finish Work', label: 'Finish Work' },
-  { value: 'Garage Doors', label: 'Garage Doors' },
-  { value: 'Landscaping / Hardscaping', label: 'Landscaping / Hardscaping' },
-];
 
 // ── Subcontractor form modal ──────────────────────────────────────────────────
 
@@ -103,15 +83,15 @@ export function SubcontractorFormModal({ initial, initialTrade, onSaved, onClose
                 <label
                   key={value}
                   className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm transition-colors ${
-                    selectedTrades.has(value)
+                    selectedTrades.has(label)
                       ? 'border-blue-300 bg-blue-50 text-blue-800'
                       : 'border-slate-200 text-slate-600 hover:bg-slate-50'
                   }`}
                 >
                   <input
                     type="checkbox"
-                    checked={selectedTrades.has(value)}
-                    onChange={() => toggleTrade(value)}
+                    checked={selectedTrades.has(label)}
+                    onChange={() => toggleTrade(label)}
                     className="accent-blue-600"
                   />
                   {label}
