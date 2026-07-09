@@ -210,15 +210,53 @@ function MaterialsModal({
 
 // ── Verify modal ──────────────────────────────────────────────────────────────
 
+/** A staged clarification for a gap: typed text and/or an uploaded supporting file. */
+export interface PendingClarification {
+  clarification: string;
+  file: File | null;
+}
+
+const VERIFY_ACCEPT = '.pdf,.png,.jpg,.jpeg,.webp,.gif';
+const MAX_VERIFY_FILE_BYTES = 20 * 1024 * 1024; // 20 MB
+
+/** Reads a File and returns its base64 contents (without the `data:...;base64,` prefix). */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      resolve(result.slice(result.indexOf(',') + 1));
+    };
+    reader.onerror = () => reject(reader.error ?? new Error('Failed to read file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
 interface VerifyModalProps {
   gap: string;
   initialValue: string;
-  onSave: (clarification: string) => void;
+  initialFile: File | null;
+  onSave: (clarification: string, file: File | null) => void;
   onClose: () => void;
 }
 
-function VerifyModal({ gap, initialValue, onSave, onClose }: VerifyModalProps) {
+function VerifyModal({ gap, initialValue, initialFile, onSave, onClose }: VerifyModalProps) {
   const [value, setValue] = useState(initialValue);
+  const [file, setFile] = useState<File | null>(initialFile);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handlePick = (picked: File | null) => {
+    if (picked && picked.size > MAX_VERIFY_FILE_BYTES) {
+      setFileError('File is too large (max 20 MB).');
+      return;
+    }
+    setFileError(null);
+    setFile(picked);
+  };
+
+  const canSave = value.trim().length > 0 || file !== null;
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
@@ -236,6 +274,46 @@ function VerifyModal({ gap, initialValue, onSave, onClose }: VerifyModalProps) {
           autoFocus
           className="mt-4 w-full rounded-lg border border-slate-300 px-3 py-2.5 text-sm focus:border-blue-400 focus:outline-none focus:ring-1 focus:ring-blue-400"
         />
+
+        {/* File upload — let AI read a spec sheet, photo, or PDF to determine the value */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept={VERIFY_ACCEPT}
+          className="hidden"
+          onChange={(e) => handlePick(e.target.files?.[0] ?? null)}
+        />
+        {file ? (
+          <div className="mt-3 flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="shrink-0 text-slate-400" aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M14 2v6h6" />
+            </svg>
+            <span className="min-w-0 flex-1 truncate text-slate-700">{file.name}</span>
+            <button
+              type="button"
+              onClick={() => handlePick(null)}
+              className="shrink-0 text-xs font-medium text-slate-500 underline hover:text-slate-700"
+            >
+              remove
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-slate-300 px-3 py-2.5 text-sm font-medium text-slate-600 transition-colors hover:border-blue-400 hover:text-blue-600"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
+            </svg>
+            Upload a file for AI to read
+          </button>
+        )}
+        {fileError && (
+          <p className="mt-2 text-xs text-red-600">{fileError}</p>
+        )}
+
         <div className="mt-5 flex justify-end gap-3">
           <button
             type="button"
@@ -247,9 +325,9 @@ function VerifyModal({ gap, initialValue, onSave, onClose }: VerifyModalProps) {
           <button
             type="button"
             onClick={() => {
-              if (value.trim()) onSave(value.trim());
+              if (canSave) onSave(value.trim(), file);
             }}
-            disabled={!value.trim()}
+            disabled={!canSave}
             className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
             Save
@@ -281,7 +359,7 @@ function UnverifiedWarning({ count }: { count: number }) {
 
 interface TakeoffPanelProps {
   data: TakeoffData;
-  pending: Map<string, string>;
+  pending: Map<string, PendingClarification>;
   onVerify: (gap: string) => void;
   readOnly?: boolean;
 }
@@ -361,6 +439,9 @@ function TakeoffPanel({ data, pending, onVerify, readOnly = false }: TakeoffPane
           <ul className="mt-2 space-y-1.5 pl-5 text-sm text-amber-700">
             {gaps.map((gap) => {
               const savedValue = pending.get(gap.description);
+              const savedLabel = savedValue
+                ? savedValue.clarification || savedValue.file?.name
+                : undefined;
               return (
                 <li key={`${gap.trade}::${gap.description}`} className="list-disc">
                   <span className="mr-1.5 rounded bg-amber-200 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
@@ -370,7 +451,7 @@ function TakeoffPanel({ data, pending, onVerify, readOnly = false }: TakeoffPane
                   {!readOnly && (savedValue ? (
                     <>
                       <span className="ml-2 italic text-blue-700">
-                        "{savedValue}"
+                        {savedValue.file && !savedValue.clarification ? '📎 ' : ''}"{savedLabel}"
                       </span>
                       <button
                         type="button"
@@ -414,7 +495,7 @@ interface MaterialsPanelProps {
   takeoffId: string;
   sections: MaterialsSection[] | null;
   initialOverrides?: Record<string, number>;
-  pending: Map<string, string>;
+  pending: Map<string, PendingClarification>;
   updating: boolean;
   updateError: string | null;
   onVerify: (gap: string) => void;
@@ -562,7 +643,8 @@ function MaterialsPanel({
                               {savedValue ? (
                                 <>
                                   <span className="italic text-blue-600">
-                                    "{savedValue}"
+                                    {savedValue.file && !savedValue.clarification ? '📎 ' : ''}
+                                    "{savedValue.clarification || savedValue.file?.name}"
                                   </span>
                                   {' · '}
                                   <button
@@ -2787,7 +2869,7 @@ export function TakeoffView({
 
   // When in sub view, filter sections to only the delegated trades.
   const subDelegations = localData.bid?.delegations ?? {};
-  const [pending, setPending] = useState<Map<string, string>>(new Map());
+  const [pending, setPending] = useState<Map<string, PendingClarification>>(new Map());
   const [updating, setUpdating] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
@@ -2829,8 +2911,8 @@ export function TakeoffView({
         .map((s) => ({ trade: s.trade, items: s.items }))
     : null;
 
-  const handleSave = (clarification: string) => {
-    setPending((prev) => new Map(prev).set(activeGap!, clarification));
+  const handleSave = (clarification: string, file: File | null) => {
+    setPending((prev) => new Map(prev).set(activeGap!, { clarification, file }));
     setActiveGap(null);
   };
 
@@ -2839,12 +2921,18 @@ export function TakeoffView({
     setUpdating(true);
     setUpdateError(null);
     try {
-      const { updatedSections, resolvedGaps } = await clarifyTakeoff(
-        takeoff.id,
-        [...pending.entries()].map(([gap, clarification]) => ({
+      const clarificationInputs = await Promise.all(
+        [...pending.entries()].map(async ([gap, { clarification, file }]) => ({
           gap,
           clarification,
+          file: file
+            ? { name: file.name, mediaType: file.type, data: await fileToBase64(file) }
+            : null,
         })),
+      );
+      const { updatedSections, resolvedGaps } = await clarifyTakeoff(
+        takeoff.id,
+        clarificationInputs,
       );
       setLocalData((prev) => {
         const sections = [...prev.sections];
@@ -2892,7 +2980,8 @@ export function TakeoffView({
       {activeGap !== null && (
         <VerifyModal
           gap={activeGap}
-          initialValue={pending.get(activeGap) ?? ''}
+          initialValue={pending.get(activeGap)?.clarification ?? ''}
+          initialFile={pending.get(activeGap)?.file ?? null}
           onSave={handleSave}
           onClose={() => setActiveGap(null)}
         />

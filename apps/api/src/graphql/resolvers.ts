@@ -13,9 +13,38 @@ const bad = (message: string) => new GraphQLError(message, { extensions: { code:
 const UNIQUE_VIOLATION = '23505';
 
 // ── clarifyTakeoff ──────────────────────────────────────────────────────────
+type ClarificationFile = { name: string; mediaType: string; data: string };
+
+// Image media types Claude accepts as image blocks; everything else is treated as a document (PDF).
+const IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+// Resolve a usable media type, inferring from the file extension when the client didn't supply one.
+function resolveMediaType(file: ClarificationFile): string {
+  if (file.mediaType) return file.mediaType;
+  const ext = file.name.toLowerCase().split('.').pop();
+  switch (ext) {
+    case 'pdf': return 'application/pdf';
+    case 'png': return 'image/png';
+    case 'jpg':
+    case 'jpeg': return 'image/jpeg';
+    case 'gif': return 'image/gif';
+    case 'webp': return 'image/webp';
+    default: return 'application/pdf';
+  }
+}
+
+// Build the Anthropic content block for an attached clarification file.
+function fileBlock(file: ClarificationFile) {
+  const mediaType = resolveMediaType(file);
+  if (IMAGE_MEDIA_TYPES.has(mediaType)) {
+    return { type: 'image' as const, source: { type: 'base64' as const, media_type: mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp', data: file.data } };
+  }
+  return { type: 'document' as const, source: { type: 'base64' as const, media_type: 'application/pdf' as const, data: file.data } };
+}
+
 async function clarifyTakeoff(
   _: unknown,
-  args: { takeoffId: string; clarifications: { gap: string; clarification: string }[] },
+  args: { takeoffId: string; clarifications: { gap: string; clarification: string; file?: ClarificationFile | null }[] },
   ctx: GqlContext,
 ) {
   const user = await requireUser(ctx);
@@ -32,36 +61,51 @@ async function clarifyTakeoff(
     .single();
   if (takeoffError || !takeoff) throw new GraphQLError('Takeoff not found.', { extensions: { code: 'NOT_FOUND' } });
 
-  const clarificationList = clarifications
-    .map((c, i) => `Gap ${i + 1}: "${c.gap}"\nClarification: "${c.clarification}"`)
-    .join('\n\n');
+  // Interleave each gap's clarification (and any attached file) so the model can tie an
+  // uploaded spec sheet / photo / PDF to the specific gap it resolves.
+  const content: Array<Record<string, unknown>> = [
+    {
+      type: 'text',
+      text: `You are a construction estimator revising a quantity takeoff with multiple newly clarified pieces of information.
 
-  const message = await getAnthropic().messages.create({
-    model: CLAUDE_MODEL,
-    max_tokens: 8000,
-    messages: [
-      {
-        role: 'user',
-        content: `You are a construction estimator revising a quantity takeoff with multiple newly clarified pieces of information.
-
-The following gaps have been resolved by the user:
-
-${clarificationList}
-
-Current takeoff (sections and gaps only):
+The following gaps have been resolved by the user:`,
+    },
+  ];
+  clarifications.forEach((c, i) => {
+    content.push({
+      type: 'text',
+      text: `Gap ${i + 1}: "${c.gap}"\nClarification: "${c.clarification || '(see attached file)'}"`,
+    });
+    if (c.file?.data) {
+      content.push({
+        type: 'text',
+        text: `Attached file for Gap ${i + 1} ("${c.file.name}") — read it and extract the value(s) needed to resolve this gap:`,
+      });
+      content.push(fileBlock(c.file));
+    }
+  });
+  content.push({
+    type: 'text',
+    text: `Current takeoff (sections and gaps only):
 ${JSON.stringify({ sections: takeoff.data.sections, gaps: takeoff.data.gaps }, null, 2)}
 
 Instructions:
 - Update all line items affected by any of the clarifications above.
-- Set source to "stated" if the user gave an explicit value, or "derived" if you computed it from their input.
+- When a gap has an attached file, read the file to determine the correct value.
+- Set source to "stated" if the user (or the attached file) gave an explicit value, or "derived" if you computed it from their input.
 - Return the complete updated section (every item, not just changed ones) for each section that changed.
 - Only include sections where something actually changed.
 - resolvedGaps must be an array containing the EXACT gap strings, character-for-character, for every gap you resolved.
 
 Respond with ONLY this JSON — no markdown, no prose:
 {"updatedSections":[],"resolvedGaps":[]}`,
-      },
-    ],
+  });
+
+  const message = await getAnthropic().messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 8000,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    messages: [{ role: 'user', content: content as any }],
   });
 
   if (message.stop_reason === 'refusal') {

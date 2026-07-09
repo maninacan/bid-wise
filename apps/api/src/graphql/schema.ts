@@ -37,9 +37,20 @@ export const typeDefs = `#graphql
     balanceCents: Int!
   }
 
+  input ClarificationFileInput {
+    "Original file name (used for display and to infer the media type when needed)."
+    name: String!
+    "MIME type, e.g. application/pdf or image/png."
+    mediaType: String!
+    "Base64-encoded file contents (no data: prefix)."
+    data: String!
+  }
+
   input ClarificationInput {
     gap: String!
     clarification: String!
+    "Optional supporting file (spec sheet, photo, PDF) for the model to read."
+    file: ClarificationFileInput
   }
 
   type ClarifyResult {

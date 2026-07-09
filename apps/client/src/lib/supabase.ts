@@ -561,9 +561,20 @@ export async function cancelAllActiveTakeoffs(): Promise<void> {
   await Promise.all(planIds.map((id) => cancelTakeoff(id)));
 }
 
+export interface ClarificationFileInput {
+  /** Original file name. */
+  name: string;
+  /** MIME type, e.g. application/pdf or image/png. */
+  mediaType: string;
+  /** Base64-encoded contents (no data: prefix). */
+  data: string;
+}
+
 export interface ClarificationInput {
   gap: string;
   clarification: string;
+  /** Optional supporting file for the model to read. */
+  file?: ClarificationFileInput | null;
 }
 
 export interface ClarifyResult {
