@@ -1396,6 +1396,12 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
   const [aiTokens, setAiTokens] = useState<number | null>(null);
   const [aiDurationMs, setAiDurationMs] = useState<number | null>(null);
   const aiElapsedMs = useStopwatch(aiLoading);
+
+  // Per-item AI pricing — lets a single custom line item (added after the bulk fetch) get
+  // priced without re-running AI pricing for every item.
+  const [itemPricing, setItemPricing] = useState<Set<string>>(new Set());
+  const [itemPriceErrors, setItemPriceErrors] = useState<Record<string, string>>({});
+
   const [delegations, setDelegations] = useState<Record<string, DelegationData>>(
     initialBid?.delegations ?? {},
   );
@@ -1435,6 +1441,47 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
 
   const removeCustomItem = (trade: string, description: string) =>
     setCustomItems((prev) => prev.filter((c) => !(c.trade === trade && c.description === description)));
+
+  // ── Edit an existing custom item ──
+  // `editingCustomKey` identifies the item being edited (captured at edit-start, so renaming
+  // the description mid-edit doesn't break the match against the original item).
+  const [editingCustomKey, setEditingCustomKey] = useState<string | null>(null);
+  const [editDesc, setEditDesc] = useState('');
+  const [editUnit, setEditUnit] = useState('EA');
+  const [editQty, setEditQty] = useState('1');
+  const [editError, setEditError] = useState<string | null>(null);
+
+  const startEditCustomItem = (trade: string, item: { description: string; unit: string; quantity: number }) => {
+    setEditingCustomKey(bidKey(trade, item.description));
+    setEditDesc(item.description);
+    setEditUnit(item.unit);
+    setEditQty(String(item.quantity));
+    setEditError(null);
+  };
+  const cancelEditCustomItem = () => {
+    setEditingCustomKey(null);
+    setEditError(null);
+  };
+  const commitEditCustomItem = (trade: string, originalDescription: string) => {
+    const description = editDesc.trim();
+    const quantity = parseFloat(editQty);
+    const unit = editUnit.trim() || 'EA';
+    if (!description) return setEditError('Enter a description.');
+    if (!(quantity > 0)) return setEditError('Enter a quantity greater than 0.');
+    const duplicate =
+      (description !== originalDescription &&
+        customItems.some((c) => c.trade === trade && c.description === description)) ||
+      sections.some((s) => s.trade === trade && s.items.some((it) => it.description === description));
+    if (duplicate) return setEditError('That trade already has an item with this description.');
+    setCustomItems((prev) =>
+      prev.map((c) =>
+        c.trade === trade && c.description === originalDescription
+          ? { trade, description, unit, quantity }
+          : c,
+      ),
+    );
+    setEditingCustomKey(null);
+  };
 
   // ── Add-line-item drafts ──
   // `addItemTrade` = the existing trade whose inline "add item" form is open (null = none);
@@ -1637,6 +1684,36 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
       </button>
     );
 
+  // Auto-saves a set of AI prices immediately (bulk fetch or a single per-item fetch).
+  // Uses only actual manual overrides for `prices` (not initialBid.prices, which may
+  // contain stale AI prices from a prior save).
+  const persistAiPrices = async (mergedAiPrices: Record<string, PriceParts>, zip: string) => {
+    const manualOnly: Record<string, PriceValue> = {};
+    for (const k of Object.keys(manualPrices)) {
+      const mp = manualPrices[k];
+      if (mp.material !== '' || mp.labor !== '') {
+        manualOnly[k] = {
+          material: mp.material ? parseFloat(mp.material) || 0 : priceParts(mergedAiPrices[k]).material,
+          labor: mp.labor ? parseFloat(mp.labor) || 0 : priceParts(mergedAiPrices[k]).labor,
+        };
+      }
+    }
+    const savedData = await saveBid(takeoffId, {
+      prices: manualOnly,
+      aiPrices: mergedAiPrices,
+      aiPricesUpdatedAt: new Date().toISOString(),
+      aiPricesZipCode: zip,
+      delegations: initialBid?.delegations,
+      excludedTrades: initialBid?.excludedTrades,
+      excludedItems: excludedItems.size > 0 ? [...excludedItems] : undefined,
+      customItems: customItems.length > 0 ? customItems : undefined,
+      overheadPct: initialBid?.overheadPct ?? 10,
+      profitPct: initialBid?.profitPct ?? 10,
+      contingencyPct: initialBid?.contingencyPct ?? 5,
+    });
+    onSaved(savedData);
+  };
+
   const handleAiPricing = async () => {
     if (!zipCode.trim()) return;
     setAiLoading(true);
@@ -1669,37 +1746,42 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
       setAiTokens(totalTokens);
       setAiDurationMs(Date.now() - startedAt);
       setZipPromptOpen(false);
-
-      // Auto-save AI prices immediately. Use only actual manual overrides for `prices`
-      // (not initialBid.prices, which may contain stale AI prices from a prior save).
-      const manualOnly: Record<string, PriceValue> = {};
-      for (const k of Object.keys(manualPrices)) {
-        const mp = manualPrices[k];
-        if (mp.material !== '' || mp.labor !== '') {
-          manualOnly[k] = {
-            material: mp.material ? parseFloat(mp.material) || 0 : priceParts(prices[k]).material,
-            labor: mp.labor ? parseFloat(mp.labor) || 0 : priceParts(prices[k]).labor,
-          };
-        }
-      }
-      const savedData = await saveBid(takeoffId, {
-        prices: manualOnly,
-        aiPrices: prices,
-        aiPricesUpdatedAt: now.toISOString(),
-        aiPricesZipCode: zip,
-        delegations: initialBid?.delegations,
-        excludedTrades: initialBid?.excludedTrades,
-        excludedItems: excludedItems.size > 0 ? [...excludedItems] : undefined,
-        customItems: customItems.length > 0 ? customItems : undefined,
-        overheadPct: initialBid?.overheadPct ?? 10,
-        profitPct: initialBid?.profitPct ?? 10,
-        contingencyPct: initialBid?.contingencyPct ?? 5,
-      });
-      onSaved(savedData);
+      await persistAiPrices(prices, zip);
     } catch (err) {
       setAiError(err instanceof Error ? err.message : 'Pricing request failed.');
     } finally {
       setAiLoading(false);
+    }
+  };
+
+  // Prices a single item (used by the small AI button on custom line items) without
+  // re-fetching pricing for everything else. Reuses the last zip code used, if any.
+  const handleAiPriceForItem = async (trade: string, item: MergedItem) => {
+    const zip = zipCode.trim() || aiPricesZipCode;
+    if (!zip) return;
+    const key = bidKey(trade, item.description);
+    setItemPricing((prev) => new Set(prev).add(key));
+    setItemPriceErrors((prev) => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    try {
+      const { prices } = await getLocalPricing(zip, [{ trade, description: item.description, unit: item.unit }], takeoffId);
+      const merged = { ...aiPrices, ...prices };
+      setAiPrices(merged);
+      setAiPricesUpdatedAt(new Date());
+      setAiPricesZipCode(zip);
+      await persistAiPrices(merged, zip);
+    } catch (err) {
+      setItemPriceErrors((prev) => ({ ...prev, [key]: err instanceof Error ? err.message : 'Pricing failed.' }));
+    } finally {
+      setItemPricing((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
     }
   };
 
@@ -1977,34 +2059,85 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                     const lineTotal = qty * effectiveUnitPrice(key);
                     const itemExcluded = excludedItems.has(key);
                     const isCustom = !!item.isCustom;
+                    const isEditing = isCustom && editingCustomKey === key;
                     return (
                       <tr key={i} className={`border-b border-slate-50 align-middle ${itemExcluded ? 'bg-rose-50/50' : isCustom ? 'bg-indigo-50/60' : ''}`}>
                         <td className="py-1.5 pr-3 text-slate-700">
-                          <span className={itemExcluded ? 'text-rose-400 line-through' : isCustom ? 'font-medium text-indigo-900' : undefined}>
-                            <AcronymText text={item.description} />
-                          </span>
-                          {isCustom && (
-                            <span className="ml-2 rounded bg-indigo-100 px-1.5 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
-                              Custom
-                            </span>
-                          )}
-                          {isCustom && !readOnly && (
-                            <button
-                              type="button"
-                              onClick={() => removeCustomItem(section.trade, item.description)}
-                              title="Remove this custom item"
-                              className="ml-1.5 rounded px-1 align-middle text-[11px] font-semibold text-slate-300 transition-colors hover:text-red-600"
-                            >
-                              ✕
-                            </button>
-                          )}
-                          {excludeToggle(key)}
-                          {item.notes && (
-                            <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
+                          {isEditing ? (
+                            <div>
+                              <input
+                                type="text"
+                                autoFocus
+                                value={editDesc}
+                                onChange={(e) => setEditDesc(e.target.value)}
+                                className="w-full rounded border border-indigo-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+                              />
+                              {editError && <p className="mt-1 text-xs text-red-600">{editError}</p>}
+                              <div className="mt-1 flex gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => commitEditCustomItem(section.trade, item.description)}
+                                  className="text-xs font-medium text-indigo-600 hover:text-indigo-500"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={cancelEditCustomItem}
+                                  className="text-xs font-medium text-slate-500 hover:text-slate-700"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <span className={itemExcluded ? 'text-rose-400 line-through' : isCustom ? 'font-medium text-indigo-900' : undefined}>
+                                <AcronymText text={item.description} />
+                              </span>
+                              {isCustom && (
+                                <span className="ml-2 rounded bg-indigo-100 px-1.5 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
+                                  Custom
+                                </span>
+                              )}
+                              {isCustom && !readOnly && (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => startEditCustomItem(section.trade, item)}
+                                    title="Edit this custom item"
+                                    className="ml-1.5 rounded px-1 align-middle text-[11px] font-semibold text-slate-300 transition-colors hover:text-indigo-600"
+                                  >
+                                    ✎
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => removeCustomItem(section.trade, item.description)}
+                                    title="Remove this custom item"
+                                    className="ml-1 rounded px-1 align-middle text-[11px] font-semibold text-slate-300 transition-colors hover:text-red-600"
+                                  >
+                                    ✕
+                                  </button>
+                                </>
+                              )}
+                              {excludeToggle(key)}
+                              {item.notes && (
+                                <span className="block text-xs text-slate-400"><AcronymText text={item.notes} /></span>
+                              )}
+                            </>
                           )}
                         </td>
                         <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
-                          {quantityOverrides[key] != null ? (
+                          {isEditing ? (
+                            <input
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={editQty}
+                              onChange={(e) => setEditQty(e.target.value)}
+                              className="w-full rounded border border-indigo-200 px-2 py-0.5 text-right text-sm tabular-nums text-slate-700 focus:border-indigo-400 focus:outline-none"
+                            />
+                          ) : quantityOverrides[key] != null ? (
                             <span className="text-slate-300 line-through">{item.quantity.toLocaleString()}</span>
                           ) : (
                             item.quantity.toLocaleString()
@@ -2027,8 +2160,46 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                             />
                           )}
                         </td>
-                        <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
-                        <td className="py-1.5 pr-3">{aiCell(ai)}</td>
+                        <td className="py-1.5 pr-3 text-slate-500">
+                          {isEditing ? (
+                            <select
+                              value={editUnit}
+                              onChange={(e) => setEditUnit(e.target.value)}
+                              className="w-full rounded border border-indigo-200 bg-white px-1 py-0.5 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+                            >
+                              {Object.entries(UNIT_LABELS).map(([abbr, label]) => (
+                                <option key={abbr} value={abbr}>{abbr} — {label}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <Unit value={item.unit} />
+                          )}
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          {isCustom && !readOnly ? (
+                            <div className="flex flex-col items-end gap-1">
+                              {ai && aiCell(ai)}
+                              <button
+                                type="button"
+                                onClick={() => handleAiPriceForItem(section.trade, item)}
+                                disabled={itemPricing.has(key) || !(zipCode.trim() || aiPricesZipCode)}
+                                title={
+                                  zipCode.trim() || aiPricesZipCode
+                                    ? 'Get AI price for this item'
+                                    : 'Enter a ZIP code above first'
+                                }
+                                className="rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700 transition-colors hover:bg-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
+                              >
+                                {itemPricing.has(key) ? '…' : ai ? '↻ AI price' : '✨ AI price'}
+                              </button>
+                              {itemPriceErrors[key] && (
+                                <span className="text-[10px] text-red-600">{itemPriceErrors[key]}</span>
+                              )}
+                            </div>
+                          ) : (
+                            aiCell(ai)
+                          )}
+                        </td>
                         <td className="py-1 pr-3">
                           {priceInputs(
                             mp?.material ?? '',
