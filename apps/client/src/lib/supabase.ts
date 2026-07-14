@@ -665,6 +665,47 @@ export async function saveMaterialsOverrides(
   return saved.data as TakeoffData;
 }
 
+/** Persists an edited assumption/note on a single takeoff line item. Returns the updated data. */
+export async function saveLineItemNotes(
+  takeoffId: string,
+  trade: string,
+  description: string,
+  notes: string,
+): Promise<TakeoffData> {
+  const { data: row, error: fetchError } = await supabase
+    .from('takeoffs')
+    .select('data')
+    .eq('id', takeoffId)
+    .single();
+  if (fetchError || !row) throw fetchError ?? new Error('Takeoff not found');
+
+  const current = row.data as TakeoffData;
+  const trimmed = notes.trim();
+  const sections = current.sections.map((section) =>
+    section.trade !== trade
+      ? section
+      : {
+          ...section,
+          items: section.items.map((item) =>
+            item.description !== description
+              ? item
+              : { ...item, notes: trimmed || undefined },
+          ),
+        },
+  );
+  const updatedData: TakeoffData = { ...current, sections };
+
+  const { data: saved, error } = await supabase
+    .from('takeoffs')
+    .update({ data: updatedData })
+    .eq('id', takeoffId)
+    .select('data')
+    .single();
+  if (error) throw error;
+  if (!saved) throw new Error('Notes save returned no data');
+  return saved.data as TakeoffData;
+}
+
 /** Persists bid pricing data onto the takeoff's data object. Returns the updated data. */
 export async function saveBid(
   takeoffId: string,

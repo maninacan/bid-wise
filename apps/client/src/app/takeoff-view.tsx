@@ -18,7 +18,7 @@ import type {
   TakeoffItem,
   TakeoffSection,
 } from '../lib/supabase';
-import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, priceParts, priceTotal, saveBid, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
+import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, priceParts, priceTotal, saveBid, saveLineItemNotes, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
 import { notifyCreditsChanged } from './billing-screen';
 import { SubcontractorFormModal } from './subs-screen';
 
@@ -31,6 +31,13 @@ const sourceBadgeStyles: Record<string, string> = {
   stated: 'bg-green-100 text-green-800',
   derived: 'bg-blue-100 text-blue-800',
   estimated: 'bg-amber-100 text-amber-800',
+};
+
+/** Tooltip copy explaining how each source classification was determined (see generate-takeoff). */
+const sourceBadgeDescriptions: Record<string, string> = {
+  stated: 'This quantity is explicitly called out on the plans, e.g. a schedule or note gives the count.',
+  derived: 'This quantity was calculated from plan dimensions, e.g. area from a room footprint.',
+  estimated: 'This quantity could not be read from the plans — it was estimated from typical construction practice.',
 };
 
 /** Spelled-out names for the bid unit abbreviations (see generate-takeoff). */
@@ -358,15 +365,50 @@ function UnverifiedWarning({ count }: { count: number }) {
 // ── Takeoff tab panel ─────────────────────────────────────────────────────────
 
 interface TakeoffPanelProps {
+  takeoffId: string;
   data: TakeoffData;
   pending: Map<string, PendingClarification>;
   onVerify: (gap: string) => void;
+  onNotesSaved: (data: TakeoffData) => void;
   readOnly?: boolean;
+  /** Notes/assumptions are editable by the GC only, even when gap verification (readOnly) is not locked. */
+  canEditNotes?: boolean;
 }
 
-function TakeoffPanel({ data, pending, onVerify, readOnly = false }: TakeoffPanelProps) {
+function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, readOnly = false, canEditNotes = false }: TakeoffPanelProps) {
   const gaps = data.gaps.map(normalizeGap);
   const unverifiedCount = gaps.filter((gap) => !pending.has(gap.description)).length;
+
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const startEditing = (trade: string, item: TakeoffItem) => {
+    setEditingKey(`${trade}::${item.description}`);
+    setDraft(item.notes ?? '');
+    setSaveError(null);
+  };
+
+  const cancelEditing = () => {
+    setEditingKey(null);
+    setSaveError(null);
+  };
+
+  const saveEditing = async (trade: string, description: string) => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const updated = await saveLineItemNotes(takeoffId, trade, description, draft);
+      onNotesSaved(updated);
+      setEditingKey(null);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Save failed.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div className="mt-5">
       <UnverifiedWarning count={unverifiedCount} />
@@ -400,32 +442,82 @@ function TakeoffPanel({ data, pending, onVerify, readOnly = false }: TakeoffPane
               </tr>
             </thead>
             <tbody>
-              {section.items.map((item, i) => (
-                <tr key={i} className="border-b border-slate-100 align-top">
-                  <td className="py-1.5 pr-2 text-slate-700">
-                    <AcronymText text={item.description} />
-                    {item.notes && (
-                      <span className="block text-xs text-slate-400">
-                        <AcronymText text={item.notes} />
-                      </span>
-                    )}
-                  </td>
-                  <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
-                    {item.quantity.toLocaleString()}
-                  </td>
-                  <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
-                  <td className="py-1.5">
-                    <span
-                      className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                        sourceBadgeStyles[item.source] ??
-                        'bg-slate-100 text-slate-600'
-                      }`}
-                    >
-                      {item.source}
-                    </span>
-                  </td>
-                </tr>
-              ))}
+              {section.items.map((item, i) => {
+                const key = `${section.trade}::${item.description}`;
+                const isEditing = editingKey === key;
+                return (
+                  <tr key={i} className="border-b border-slate-100 align-top">
+                    <td className="py-1.5 pr-2 text-slate-700">
+                      <AcronymText text={item.description} />
+                      {isEditing ? (
+                        <div className="mt-1">
+                          <textarea
+                            autoFocus
+                            value={draft}
+                            onChange={(e) => setDraft(e.target.value)}
+                            placeholder="Assumption / note for this line item"
+                            rows={2}
+                            className="w-full rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
+                          />
+                          {saveError && (
+                            <p className="mt-1 text-xs text-red-600">{saveError}</p>
+                          )}
+                          <div className="mt-1 flex gap-2">
+                            <button
+                              type="button"
+                              disabled={saving}
+                              onClick={() => saveEditing(section.trade, item.description)}
+                              className="text-xs font-medium text-blue-600 hover:text-blue-500 disabled:opacity-50"
+                            >
+                              {saving ? 'Saving…' : 'Save'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={saving}
+                              onClick={cancelEditing}
+                              className="text-xs font-medium text-slate-500 hover:text-slate-700 disabled:opacity-50"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="block text-xs text-slate-400">
+                          {item.notes && <AcronymText text={item.notes} />}
+                          {canEditNotes && (
+                            <button
+                              type="button"
+                              onClick={() => startEditing(section.trade, item)}
+                              className={`font-medium text-blue-600 underline hover:text-blue-500 ${item.notes ? 'ml-1.5' : ''}`}
+                            >
+                              {item.notes ? 'edit' : 'add assumption'}
+                            </button>
+                          )}
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
+                      {item.quantity.toLocaleString()}
+                    </td>
+                    <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
+                    <td className="py-1.5">
+                      <Tooltip
+                        content={sourceBadgeDescriptions[item.source]}
+                        className="cursor-help"
+                      >
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                            sourceBadgeStyles[item.source] ??
+                            'bg-slate-100 text-slate-600'
+                          }`}
+                        >
+                          {item.source}
+                        </span>
+                      </Tooltip>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -3060,10 +3152,13 @@ export function TakeoffView({
         {/* Tab panels */}
         {activeTab === 'takeoff' && (
           <TakeoffPanel
+            takeoffId={takeoff.id}
             data={isSubView ? { ...localData, sections: visibleSections, gaps: visibleGaps } : localData}
             pending={(isSubView || locked) ? new Map() : pending}
             onVerify={(gap) => setActiveGap(gap)}
+            onNotesSaved={setLocalData}
             readOnly={locked}
+            canEditNotes={!isSubView && !locked}
           />
         )}
 
