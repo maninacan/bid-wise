@@ -18,7 +18,7 @@ import type {
   TakeoffItem,
   TakeoffSection,
 } from '../lib/supabase';
-import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, priceParts, priceTotal, saveBid, saveLineItemNotes, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
+import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, priceParts, priceTotal, recalculateMaterials, saveBid, saveLineItemNotes, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
 import { notifyCreditsChanged } from './billing-screen';
 import { SubcontractorFormModal } from './subs-screen';
 
@@ -443,19 +443,45 @@ interface TakeoffPanelProps {
   pending: Map<string, PendingClarification>;
   onVerify: (gap: string) => void;
   onNotesSaved: (data: TakeoffData) => void;
+  onSectionsUpdated: (updatedSections: TakeoffSection[]) => void;
   readOnly?: boolean;
   /** Notes/assumptions are editable by the GC only, even when gap verification (readOnly) is not locked. */
   canEditNotes?: boolean;
 }
 
-function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, readOnly = false, canEditNotes = false }: TakeoffPanelProps) {
+function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, onSectionsUpdated, readOnly = false, canEditNotes = false }: TakeoffPanelProps) {
   const gaps = data.gaps.map(normalizeGap);
   const unverifiedCount = gaps.filter((gap) => !pending.has(gap.description)).length;
+  const assumptionCount = data.sections.reduce(
+    (sum, s) => sum + s.items.filter((it) => it.notes?.trim()).length,
+    0,
+  );
 
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+
+  const [recalculating, setRecalculating] = useState(false);
+  const [recalcError, setRecalcError] = useState<string | null>(null);
+  const [recalcNotice, setRecalcNotice] = useState<string | null>(null);
+
+  const handleRecalculate = async () => {
+    setRecalculating(true);
+    setRecalcError(null);
+    setRecalcNotice(null);
+    try {
+      const result = await recalculateMaterials(takeoffId);
+      onSectionsUpdated(result.updatedSections);
+      setRecalcNotice(
+        `Recalculated from ${result.consideredCount} assumption${result.consideredCount === 1 ? '' : 's'}.`,
+      );
+    } catch (err) {
+      setRecalcError(err instanceof Error ? err.message : 'Recalculation failed.');
+    } finally {
+      setRecalculating(false);
+    }
+  };
 
   const startEditing = (trade: string, item: TakeoffItem) => {
     setEditingKey(`${trade}::${item.description}`);
@@ -498,6 +524,28 @@ function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, readOn
             </span>
           ))}
         </div>
+      )}
+
+      {canEditNotes && (
+        <div className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+          <p className="text-sm text-slate-600">
+            {assumptionCount > 0
+              ? `${assumptionCount} line item${assumptionCount === 1 ? '' : 's'} with an assumption noted.`
+              : 'Add a note to a line item above, then recalculate to update its quantity from that assumption.'}
+          </p>
+          <button
+            type="button"
+            onClick={handleRecalculate}
+            disabled={recalculating || assumptionCount === 0}
+            className="shrink-0 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+          >
+            {recalculating ? 'Recalculating…' : 'Recalculate materials'}
+          </button>
+        </div>
+      )}
+      {recalcError && <p className="mt-2 text-sm text-red-600">{recalcError}</p>}
+      {recalcNotice && !recalcError && (
+        <p className="mt-2 text-sm text-green-700">{recalcNotice}</p>
       )}
 
       {data.sections.map((section, i) => (
@@ -3128,6 +3176,19 @@ export function TakeoffView({
     }
   };
 
+  // Merges AI-recomputed sections (from clarifyTakeoff or recalculateMaterials) into localData.
+  const handleSectionsUpdated = (updatedSections: TakeoffSection[]) => {
+    setLocalData((prev) => {
+      const sections = [...prev.sections];
+      for (const updated of updatedSections) {
+        const idx = sections.findIndex((s) => s.trade === updated.trade);
+        if (idx >= 0) sections[idx] = updated;
+        else sections.push(updated);
+      }
+      return { ...prev, sections };
+    });
+  };
+
   const openMaterialsModal = () => {
     setMaterialsModalOpen(true);
   };
@@ -3237,6 +3298,7 @@ export function TakeoffView({
             pending={(isSubView || locked) ? new Map() : pending}
             onVerify={(gap) => setActiveGap(gap)}
             onNotesSaved={setLocalData}
+            onSectionsUpdated={handleSectionsUpdated}
             readOnly={locked}
             canEditNotes={!isSubView && !locked}
           />

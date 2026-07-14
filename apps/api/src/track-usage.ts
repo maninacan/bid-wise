@@ -4,7 +4,7 @@ export interface UsageRecord {
   user_id: string;
   plan_id?: string | null;
   takeoff_id?: string | null;
-  operation: 'generate-takeoff' | 'clarify-takeoff' | 'get-local-pricing';
+  operation: 'generate-takeoff' | 'clarify-takeoff' | 'recalculate-materials' | 'get-local-pricing';
   model: string;
   input_tokens: number;
   output_tokens: number;

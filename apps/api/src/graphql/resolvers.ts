@@ -152,6 +152,97 @@ Respond with ONLY this JSON — no markdown, no prose:
   return { updatedSections: result.updatedSections, resolvedGaps: result.resolvedGaps };
 }
 
+// ── recalculateMaterials ─────────────────────────────────────────────────────
+async function recalculateMaterials(
+  _: unknown,
+  args: { takeoffId: string },
+  ctx: GqlContext,
+) {
+  const user = await requireUser(ctx);
+  const { takeoffId } = args;
+  if (!takeoffId) throw bad('takeoffId is required.');
+
+  const { data: takeoff, error: takeoffError } = await ctx.supabase
+    .from('takeoffs')
+    .select('id, plan_id, data')
+    .eq('id', takeoffId)
+    .eq('user_id', user.id)
+    .single();
+  if (takeoffError || !takeoff) throw new GraphQLError('Takeoff not found.', { extensions: { code: 'NOT_FOUND' } });
+
+  type LineItem = { description: string; quantity: number; unit: string; source: string; notes?: string };
+  const sections = (takeoff.data.sections ?? []) as { trade: string; items: LineItem[] }[];
+
+  const annotated = sections
+    .map((s) => ({ trade: s.trade, items: s.items.filter((it) => it.notes?.trim()) }))
+    .filter((s) => s.items.length > 0);
+  const consideredCount = annotated.reduce((sum, s) => sum + s.items.length, 0);
+  if (consideredCount === 0) {
+    throw bad('No line-item assumptions to recalculate. Add a note to a line item first.');
+  }
+
+  const prompt = `You are a construction estimator revising a quantity takeoff. The contractor has added notes/assumptions to specific line items — use each note to recompute that item's quantity (and unit/source, if the note changes the reasoning).
+
+Line items with a user-added assumption:
+${JSON.stringify(annotated, null, 2)}
+
+Full current takeoff, for context (areas and all sections/items):
+${JSON.stringify({ areas: takeoff.data.areas, sections: takeoff.data.sections }, null, 2)}
+
+Instructions:
+- Recompute the quantity (and unit/source if warranted) for every item listed above under "Line items with a user-added assumption", based on its note.
+- Set source to "stated" if the note gives an explicit value, or "derived" if you computed it from the note.
+- Leave every other item in each section completely unchanged.
+- Return the complete updated section (every item, not just the recomputed ones) for each section that contains at least one recomputed item.
+- Only include sections where something actually changed.
+
+Respond with ONLY this JSON — no markdown, no prose:
+{"updatedSections":[]}`;
+
+  const message = await getAnthropic().messages.create({
+    model: CLAUDE_MODEL,
+    max_tokens: 8000,
+    messages: [{ role: 'user', content: prompt }],
+  });
+
+  if (message.stop_reason === 'refusal') {
+    throw new GraphQLError('The model declined to process this request.', { extensions: { code: 'UNPROCESSABLE' } });
+  }
+
+  const textBlock = message.content.find((b) => b.type === 'text');
+  if (!textBlock || textBlock.type !== 'text') throw new GraphQLError('No response from model.');
+
+  let text = textBlock.text.trim();
+  if (text.startsWith('```')) {
+    text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+  }
+
+  const result = JSON.parse(text) as { updatedSections: { trade: string; items: unknown[] }[] };
+
+  const updatedData = structuredClone(takeoff.data);
+  for (const section of result.updatedSections ?? []) {
+    const idx = updatedData.sections.findIndex((s: { trade: string }) => s.trade === section.trade);
+    if (idx >= 0) updatedData.sections[idx] = section;
+    else updatedData.sections.push(section);
+  }
+
+  await ctx.supabase.from('takeoffs').update({ data: updatedData }).eq('id', takeoffId);
+
+  await trackUsage(ctx.supabase, {
+    user_id: user.id,
+    plan_id: takeoff.plan_id,
+    takeoff_id: takeoff.id,
+    operation: 'recalculate-materials',
+    model: CLAUDE_MODEL,
+    input_tokens: message.usage.input_tokens,
+    output_tokens: message.usage.output_tokens,
+    cache_creation_input_tokens: message.usage.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: message.usage.cache_read_input_tokens ?? 0,
+  });
+
+  return { updatedSections: result.updatedSections, consideredCount };
+}
+
 // ── getLocalPricing ─────────────────────────────────────────────────────────
 async function getLocalPricing(
   _: unknown,
@@ -644,6 +735,7 @@ export const resolvers = {
   },
   Mutation: {
     clarifyTakeoff,
+    recalculateMaterials,
     getLocalPricing,
     saveSubPrices,
     approveSubBid,

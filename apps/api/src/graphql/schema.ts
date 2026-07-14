@@ -59,6 +59,13 @@ export const typeDefs = `#graphql
     resolvedGaps: [String!]!
   }
 
+  type RecalculateMaterialsResult {
+    "Array of TakeoffSection objects that changed."
+    updatedSections: JSON!
+    "Number of line items with a user-added assumption that were considered."
+    consideredCount: Int!
+  }
+
   input LocalPricingItemInput {
     trade: String!
     description: String!
@@ -84,6 +91,9 @@ export const typeDefs = `#graphql
   type Mutation {
     "Recompute takeoff line items from a batch of gap clarifications."
     clarifyTakeoff(takeoffId: ID!, clarifications: [ClarificationInput!]!): ClarifyResult!
+
+    "Recompute quantities for every line item that has a user-added assumption note."
+    recalculateMaterials(takeoffId: ID!): RecalculateMaterialsResult!
 
     "Estimate local unit prices for line items; returns the price map plus token usage."
     getLocalPricing(zipCode: String!, lineItems: [LocalPricingItemInput!]!, takeoffId: ID): LocalPricingResult!

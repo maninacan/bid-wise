@@ -608,6 +608,36 @@ export async function clarifyTakeoff(
   }
 }
 
+export interface RecalculateMaterialsResult {
+  updatedSections: TakeoffSection[];
+  consideredCount: number;
+}
+
+const RECALCULATE_MATERIALS = gql`
+  mutation RecalculateMaterials($takeoffId: ID!) {
+    recalculateMaterials(takeoffId: $takeoffId) {
+      updatedSections
+      consideredCount
+    }
+  }
+`;
+
+/** Recomputes quantities for every line item that has a user-added assumption note. */
+export async function recalculateMaterials(
+  takeoffId: string,
+): Promise<RecalculateMaterialsResult> {
+  try {
+    const { data } = await apolloClient.mutate<{ recalculateMaterials: RecalculateMaterialsResult }>({
+      mutation: RECALCULATE_MATERIALS,
+      variables: { takeoffId },
+      context: await authContext(),
+    });
+    return data!.recalculateMaterials;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Recalculation failed.'));
+  }
+}
+
 /** Persists the selected materials trades onto the takeoff's data object. Returns the updated data. */
 export async function saveMaterialsList(
   takeoffId: string,
