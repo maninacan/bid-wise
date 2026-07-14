@@ -12,6 +12,18 @@ const bad = (message: string) => new GraphQLError(message, { extensions: { code:
 
 const UNIQUE_VIOLATION = '23505';
 
+// Despite being asked for JSON only, the model sometimes prepends narration ("I'll ...")
+// or wraps the reply in a markdown fence. Slice out the outermost {...} rather than
+// assuming the whole text block is clean JSON.
+function extractJsonObject(text: string): string {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end === -1 || end < start) {
+    throw new GraphQLError('Model response did not contain JSON.');
+  }
+  return text.slice(start, end + 1);
+}
+
 // ── clarifyTakeoff ──────────────────────────────────────────────────────────
 type ClarificationFile = { name: string; mediaType: string; data: string };
 
@@ -115,12 +127,7 @@ Respond with ONLY this JSON — no markdown, no prose:
   const textBlock = message.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') throw new GraphQLError('No response from model.');
 
-  let text = textBlock.text.trim();
-  if (text.startsWith('```')) {
-    text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
-  }
-
-  const result = JSON.parse(text) as {
+  const result = JSON.parse(extractJsonObject(textBlock.text)) as {
     updatedSections: { trade: string; items: unknown[] }[];
     resolvedGaps: string[];
   };
@@ -212,12 +219,9 @@ Respond with ONLY this JSON — no markdown, no prose:
   const textBlock = message.content.find((b) => b.type === 'text');
   if (!textBlock || textBlock.type !== 'text') throw new GraphQLError('No response from model.');
 
-  let text = textBlock.text.trim();
-  if (text.startsWith('```')) {
-    text = text.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
-  }
-
-  const result = JSON.parse(text) as { updatedSections: { trade: string; items: unknown[] }[] };
+  const result = JSON.parse(extractJsonObject(textBlock.text)) as {
+    updatedSections: { trade: string; items: unknown[] }[];
+  };
 
   const updatedData = structuredClone(takeoff.data);
   for (const section of result.updatedSections ?? []) {

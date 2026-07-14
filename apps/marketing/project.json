@@ -59,6 +59,30 @@
         "technologies": ["astro"],
         "description": "Generate TypeScript types for Astro Content Collections and modules (via astro sync)"
       }
+    },
+    "e2e": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/marketing",
+        "command": "playwright test"
+      },
+      "cache": true,
+      "inputs": [
+        "default",
+        "^production",
+        "^{projectRoot}/tsconfig*.json",
+        {
+          "json": "{workspaceRoot}/tsconfig.json",
+          "fields": ["compilerOptions", "extends", "files", "include"]
+        },
+        {
+          "externalDependencies": ["@playwright/test"]
+        }
+      ],
+      "outputs": [
+        "{projectRoot}/test-output/playwright/output",
+        "{projectRoot}/test-output/playwright/report"
+      ]
     }
   }
 }
