@@ -239,6 +239,79 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+// ── Draft clarification persistence ──────────────────────────────────────────
+// Staged clarifications live only in memory until the user clicks "Update", so an
+// accidental refresh would otherwise wipe them. Mirror them into sessionStorage
+// (per takeoff) so they survive a refresh but still clear when the tab closes.
+
+const PENDING_STORAGE_PREFIX = 'bidwise:pendingClarifications:';
+
+interface StoredPendingFile {
+  name: string;
+  mediaType: string;
+  data: string; // base64, no `data:...;base64,` prefix
+}
+
+type StoredPendingEntry = [string, { clarification: string; file: StoredPendingFile | null }];
+
+function base64ToFile(stored: StoredPendingFile): File {
+  const binary = atob(stored.data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new File([bytes], stored.name, { type: stored.mediaType });
+}
+
+/** Restores draft clarifications staged before a refresh. Pairs with persistPendingClarifications. */
+function loadPendingClarifications(takeoffId: string): Map<string, PendingClarification> {
+  try {
+    const raw = sessionStorage.getItem(PENDING_STORAGE_PREFIX + takeoffId);
+    if (!raw) return new Map();
+    const entries: StoredPendingEntry[] = JSON.parse(raw);
+    return new Map(
+      entries.map(([gap, { clarification, file }]) => [
+        gap,
+        { clarification, file: file ? base64ToFile(file) : null },
+      ]),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+/** Mirrors staged clarifications into sessionStorage so a refresh doesn't lose them. */
+async function persistPendingClarifications(
+  takeoffId: string,
+  pending: Map<string, PendingClarification>,
+): Promise<void> {
+  const key = PENDING_STORAGE_PREFIX + takeoffId;
+  if (pending.size === 0) {
+    sessionStorage.removeItem(key);
+    return;
+  }
+  try {
+    const entries: StoredPendingEntry[] = await Promise.all(
+      [...pending.entries()].map(async ([gap, { clarification, file }]): Promise<StoredPendingEntry> => [
+        gap,
+        {
+          clarification,
+          file: file
+            ? { name: file.name, mediaType: file.type, data: await fileToBase64(file) }
+            : null,
+        },
+      ]),
+    );
+    sessionStorage.setItem(key, JSON.stringify(entries));
+  } catch (err) {
+    // Quota exceeded or a file failed to read — drop the draft rather than leave it half-written.
+    console.error('[takeoff-view] failed to persist draft clarifications:', err);
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 interface VerifyModalProps {
   gap: string;
   initialValue: string;
@@ -2961,7 +3034,9 @@ export function TakeoffView({
 
   // When in sub view, filter sections to only the delegated trades.
   const subDelegations = localData.bid?.delegations ?? {};
-  const [pending, setPending] = useState<Map<string, PendingClarification>>(new Map());
+  const [pending, setPending] = useState<Map<string, PendingClarification>>(() =>
+    loadPendingClarifications(takeoff.id),
+  );
   const [updating, setUpdating] = useState(false);
   const [updateError, setUpdateError] = useState<string | null>(null);
 
@@ -3004,7 +3079,11 @@ export function TakeoffView({
     : null;
 
   const handleSave = (clarification: string, file: File | null) => {
-    setPending((prev) => new Map(prev).set(activeGap!, { clarification, file }));
+    setPending((prev) => {
+      const next = new Map(prev).set(activeGap!, { clarification, file });
+      void persistPendingClarifications(takeoff.id, next);
+      return next;
+    });
     setActiveGap(null);
   };
 
@@ -3041,6 +3120,7 @@ export function TakeoffView({
         };
       });
       setPending(new Map());
+      void persistPendingClarifications(takeoff.id, new Map());
     } catch (err) {
       setUpdateError(err instanceof Error ? err.message : 'Update failed.');
     } finally {
