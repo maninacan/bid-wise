@@ -12,6 +12,29 @@ export const typeDefs = `#graphql
 
     "Square footage, price, and whether a takeoff's bid is already paid for — drives the Materials/Pricing/Bid payment gate."
     bidQuote(takeoffId: ID!): BidQuote!
+
+    "Aggregate usage/revenue stats for the super-admin dashboard. SuperAdmin role required."
+    adminDashboardStats: AdminDashboardStats!
+  }
+
+  type AdminDashboardStats {
+    totalUsers: Int!
+    totalTakeoffs: Int!
+    "Sum of all Stripe credit top-ups, in cents."
+    totalCreditsToppedUpCents: Int!
+    "Sum of all per-bid credit charges, in cents."
+    totalCreditsSpentCents: Int!
+    "Sum of input + output tokens across all ai_usage rows."
+    totalAiTokens: Int!
+    "Most recently created takeoffs, newest first."
+    recentTakeoffs: [RecentTakeoff!]!
+  }
+
+  type RecentTakeoff {
+    id: ID!
+    userEmail: String!
+    planName: String
+    createdAt: String!
   }
 
   type BidQuote {

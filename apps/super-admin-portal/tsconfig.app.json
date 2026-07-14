@@ -35,6 +35,9 @@
   "references": [
     {
       "path": "../../libs/data/tsconfig.lib.json"
+    },
+    {
+      "path": "../../libs/common-components/tsconfig.lib.json"
     }
   ]
 }

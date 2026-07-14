@@ -1,5 +1,6 @@
 import { StrictMode } from 'react';
 import * as ReactDOM from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
 import { ApolloProvider } from '@apollo/client/react';
 import { apolloClient } from '@bid-wise/data';
 import App from './app/app';
@@ -11,8 +12,10 @@ const root = ReactDOM.createRoot(
 
 root.render(
   <StrictMode>
-    <ApolloProvider client={apolloClient}>
-      <App />
-    </ApolloProvider>
+    <BrowserRouter>
+      <ApolloProvider client={apolloClient}>
+        <App />
+      </ApolloProvider>
+    </BrowserRouter>
   </StrictMode>,
 );

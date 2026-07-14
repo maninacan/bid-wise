@@ -29,6 +29,16 @@ async function requirePaid(ctx: GqlContext, takeoffId: string): Promise<void> {
   }
 }
 
+/** Resolves the current user and throws FORBIDDEN unless their app_metadata carries the SuperAdmin role. */
+async function requireSuperAdmin(ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const roles = (user.app_metadata?.roles ?? []) as string[];
+  if (!roles.includes('SuperAdmin')) {
+    throw new GraphQLError('Not authorized.', { extensions: { code: 'FORBIDDEN' } });
+  }
+  return user;
+}
+
 // Despite being asked for JSON only, the model sometimes prepends narration ("I'll ...")
 // or wraps the reply in a markdown fence. Slice out the outermost {...} rather than
 // assuming the whole text block is clean JSON.
@@ -790,12 +800,85 @@ async function finalizeBid(
   return { data: saved.data, balanceCents: await getBalanceCents(ctx.supabase, user.id) };
 }
 
+// ── Super-admin dashboard ────────────────────────────────────────────────────
+
+interface RecentTakeoffRow {
+  id: string;
+  user_id: string;
+  created_at: string;
+  house_plans: { name: string | null; file_name: string } | null;
+}
+
+async function adminDashboardStats(_: unknown, __: unknown, ctx: GqlContext) {
+  await requireSuperAdmin(ctx);
+
+  // auth.users isn't queryable via postgrest, so walk the admin listUsers() pages to get
+  // both an exact user count and an id -> email lookup for the recent-takeoffs table.
+  const emailsById = new Map<string, string>();
+  for (let page = 1; ; page += 1) {
+    const { data, error } = await ctx.supabase.auth.admin.listUsers({ page, perPage: 200 });
+    if (error) throw error;
+    for (const u of data.users) emailsById.set(u.id, u.email ?? '');
+    if (data.users.length < 200) break;
+  }
+
+  const { count: totalTakeoffs, error: takeoffCountErr } = await ctx.supabase
+    .from('takeoffs')
+    .select('*', { count: 'exact', head: true });
+  if (takeoffCountErr) throw takeoffCountErr;
+
+  const { data: creditRows, error: creditErr } = await ctx.supabase
+    .from('credit_transactions')
+    .select('kind, amount_cents');
+  if (creditErr) throw creditErr;
+  let totalCreditsToppedUpCents = 0;
+  let totalCreditsSpentCents = 0;
+  for (const row of (creditRows ?? []) as { kind: string; amount_cents: number }[]) {
+    if (row.kind === 'topup') totalCreditsToppedUpCents += row.amount_cents;
+    else if (row.kind === 'charge') totalCreditsSpentCents += -row.amount_cents;
+  }
+
+  const { data: usageRows, error: usageErr } = await ctx.supabase
+    .from('ai_usage')
+    .select('input_tokens, output_tokens');
+  if (usageErr) throw usageErr;
+  const totalAiTokens = (usageRows ?? []).reduce(
+    (sum: number, row: { input_tokens: number; output_tokens: number }) =>
+      sum + row.input_tokens + row.output_tokens,
+    0,
+  );
+
+  const { data: recent, error: recentErr } = await ctx.supabase
+    .from('takeoffs')
+    .select('id, user_id, created_at, house_plans(name, file_name)')
+    .order('created_at', { ascending: false })
+    .limit(10);
+  if (recentErr) throw recentErr;
+
+  const recentTakeoffs = ((recent ?? []) as unknown as RecentTakeoffRow[]).map((t) => ({
+    id: t.id,
+    userEmail: emailsById.get(t.user_id) ?? 'unknown',
+    planName: t.house_plans?.name ?? t.house_plans?.file_name ?? null,
+    createdAt: t.created_at,
+  }));
+
+  return {
+    totalUsers: emailsById.size,
+    totalTakeoffs: totalTakeoffs ?? 0,
+    totalCreditsToppedUpCents,
+    totalCreditsSpentCents,
+    totalAiTokens,
+    recentTakeoffs,
+  };
+}
+
 export const resolvers = {
   JSON: GraphQLJSON,
   Query: {
     hello: () => 'Hello from Apollo Server!',
     creditBalanceCents,
     bidQuote,
+    adminDashboardStats,
   },
   Mutation: {
     clarifyTakeoff,
