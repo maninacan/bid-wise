@@ -444,18 +444,57 @@ interface TakeoffPanelProps {
   onVerify: (gap: string) => void;
   onNotesSaved: (data: TakeoffData) => void;
   onSectionsUpdated: (updatedSections: TakeoffSection[]) => void;
+  customItems: CustomLineItem[];
+  excludedItems: Set<string>;
+  onAddCustomItem: (item: CustomLineItem) => Promise<string | undefined>;
+  onRemoveCustomItem: (trade: string, description: string) => Promise<void>;
+  onToggleExcludedItem: (key: string) => Promise<void>;
   readOnly?: boolean;
   /** Notes/assumptions are editable by the GC only, even when gap verification (readOnly) is not locked. */
   canEditNotes?: boolean;
 }
 
-function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, onSectionsUpdated, readOnly = false, canEditNotes = false }: TakeoffPanelProps) {
+function TakeoffPanel({
+  takeoffId,
+  data,
+  pending,
+  onVerify,
+  onNotesSaved,
+  onSectionsUpdated,
+  customItems,
+  excludedItems,
+  onAddCustomItem,
+  onRemoveCustomItem,
+  onToggleExcludedItem,
+  readOnly = false,
+  canEditNotes = false,
+}: TakeoffPanelProps) {
   const gaps = data.gaps.map(normalizeGap);
   const unverifiedCount = gaps.filter((gap) => !pending.has(gap.description)).length;
   const assumptionCount = data.sections.reduce(
     (sum, s) => sum + s.items.filter((it) => it.notes?.trim()).length,
     0,
   );
+  const renderSections = useMemo(() => mergeSections(data.sections, customItems), [data.sections, customItems]);
+
+  const [addItemTrade, setAddItemTrade] = useState<string | null>(null);
+  const [newTradeOpen, setNewTradeOpen] = useState(false);
+  const closeAddForms = () => { setAddItemTrade(null); setNewTradeOpen(false); };
+
+  const validateAndAdd = async (
+    values: { trade: string; description: string; unit: string; quantity: number },
+  ): Promise<string | undefined> => {
+    const trade = values.trade.trim();
+    const description = values.description.trim();
+    if (!trade) return 'Enter a trade name.';
+    if (!description) return 'Enter a description.';
+    if (!(values.quantity > 0)) return 'Enter a quantity greater than 0.';
+    const exists =
+      customItems.some((c) => c.trade === trade && c.description === description) ||
+      data.sections.some((s) => s.trade === trade && s.items.some((it) => it.description === description));
+    if (exists) return 'That trade already has an item with this description.';
+    return onAddCustomItem({ trade, description, unit: values.unit, quantity: values.quantity });
+  };
 
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [draft, setDraft] = useState('');
@@ -548,7 +587,7 @@ function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, onSect
         <p className="mt-2 text-sm text-green-700">{recalcNotice}</p>
       )}
 
-      {data.sections.map((section, i) => (
+      {renderSections.map((section, i) => (
         <div key={`${section.trade}-${i}`} className="mt-6">
           <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
             {section.trade}
@@ -566,10 +605,50 @@ function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, onSect
               {section.items.map((item, i) => {
                 const key = `${section.trade}::${item.description}`;
                 const isEditing = editingKey === key;
+                const isCustom = !!item.isCustom;
+                const isExcluded = excludedItems.has(key);
+                const struck = isExcluded ? 'text-rose-400 line-through' : undefined;
                 return (
-                  <tr key={i} className="border-b border-slate-100 align-top">
+                  <tr
+                    key={i}
+                    className={`border-b border-slate-100 align-top ${
+                      isExcluded ? 'bg-rose-50/50' : isCustom ? 'bg-indigo-50/60' : ''
+                    }`}
+                  >
                     <td className="py-1.5 pr-2 text-slate-700">
-                      <AcronymText text={item.description} />
+                      <span className={isExcluded ? struck : isCustom ? 'font-medium text-indigo-900' : undefined}>
+                        <AcronymText text={item.description} />
+                      </span>
+                      {isCustom && !isExcluded && (
+                        <span className="ml-1.5 rounded bg-indigo-100 px-1.5 py-0.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-indigo-700">
+                          Custom
+                        </span>
+                      )}
+                      {canEditNotes && (
+                        isCustom ? (
+                          <button
+                            type="button"
+                            onClick={() => onRemoveCustomItem(section.trade, item.description)}
+                            title="Remove this custom item"
+                            className="ml-1.5 rounded px-1 align-middle text-[11px] font-semibold text-slate-300 transition-colors hover:text-red-600"
+                          >
+                            ✕
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => onToggleExcludedItem(key)}
+                            title={isExcluded ? 'Restore this item' : 'Strike out this item'}
+                            className={`ml-1.5 rounded px-1.5 py-0.5 align-middle text-[10px] font-semibold transition-colors ${
+                              isExcluded
+                                ? 'bg-rose-600 text-white hover:bg-rose-500'
+                                : 'border border-slate-200 text-slate-300 hover:border-rose-300 hover:text-rose-600'
+                            }`}
+                          >
+                            {isExcluded ? 'Struck out' : 'Strike out'}
+                          </button>
+                        )
+                      )}
                       {isEditing ? (
                         <div className="mt-1">
                           <textarea
@@ -603,46 +682,94 @@ function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, onSect
                           </div>
                         </div>
                       ) : (
-                        <span className="block text-xs text-slate-400">
-                          {item.notes && <AcronymText text={item.notes} />}
-                          {canEditNotes && (
-                            <button
-                              type="button"
-                              onClick={() => startEditing(section.trade, item)}
-                              className={`font-medium text-blue-600 underline hover:text-blue-500 ${item.notes ? 'ml-1.5' : ''}`}
-                            >
-                              {item.notes ? 'edit' : 'add assumption'}
-                            </button>
-                          )}
-                        </span>
+                        !isCustom && (
+                          <span className="block text-xs text-slate-400">
+                            {item.notes && <AcronymText text={item.notes} />}
+                            {canEditNotes && (
+                              <button
+                                type="button"
+                                onClick={() => startEditing(section.trade, item)}
+                                className={`font-medium text-blue-600 underline hover:text-blue-500 ${item.notes ? 'ml-1.5' : ''}`}
+                              >
+                                {item.notes ? 'edit' : 'add assumption'}
+                              </button>
+                            )}
+                          </span>
+                        )
                       )}
                     </td>
-                    <td className="py-1.5 pr-2 text-right tabular-nums text-slate-700">
+                    <td className={`py-1.5 pr-2 text-right tabular-nums ${isExcluded ? struck : 'text-slate-700'}`}>
                       {item.quantity.toLocaleString()}
                     </td>
-                    <td className="py-1.5 pr-2 text-slate-500"><Unit value={item.unit} /></td>
+                    <td className={`py-1.5 pr-2 ${isExcluded ? struck : 'text-slate-500'}`}><Unit value={item.unit} /></td>
                     <td className="py-1.5">
-                      <Tooltip
-                        content={sourceBadgeDescriptions[item.source]}
-                        className="cursor-help"
-                      >
-                        <span
-                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                            sourceBadgeStyles[item.source] ??
-                            'bg-slate-100 text-slate-600'
-                          }`}
-                        >
-                          {item.source}
+                      {isCustom ? (
+                        <span className="rounded-full bg-indigo-100 px-2 py-0.5 text-xs font-medium text-indigo-700">
+                          custom
                         </span>
-                      </Tooltip>
+                      ) : (
+                        <Tooltip
+                          content={sourceBadgeDescriptions[item.source]}
+                          className="cursor-help"
+                        >
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                              sourceBadgeStyles[item.source] ??
+                              'bg-slate-100 text-slate-600'
+                            }`}
+                          >
+                            {item.source}
+                          </span>
+                        </Tooltip>
+                      )}
                     </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
+
+          {canEditNotes && (
+            addItemTrade === section.trade ? (
+              <AddLineItemForm
+                withTradeName={false}
+                onCancel={closeAddForms}
+                onSubmit={(values) => validateAndAdd({ ...values, trade: section.trade })}
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={() => { setAddItemTrade(section.trade); setNewTradeOpen(false); }}
+                className="mt-2 flex items-center gap-1.5 text-xs font-medium text-slate-400 transition-colors hover:text-indigo-700"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>
+                Add item to {section.trade}
+              </button>
+            )
+          )}
         </div>
       ))}
+
+      {canEditNotes && (
+        <div className="mt-6 border-t border-slate-100 pt-4">
+          {newTradeOpen ? (
+            <AddLineItemForm
+              withTradeName
+              onCancel={closeAddForms}
+              onSubmit={(values) => validateAndAdd(values)}
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={() => { setNewTradeOpen(true); setAddItemTrade(null); }}
+              className="flex items-center gap-1.5 rounded-lg border border-dashed border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-500 transition-colors hover:border-indigo-300 hover:text-indigo-700"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M12 5v14M5 12h14" /></svg>
+              Add a new trade
+            </button>
+          )}
+        </div>
+      )}
 
       {gaps.length > 0 && (
         <div className="mt-6 rounded-lg bg-amber-50 p-4">
@@ -693,6 +820,109 @@ function TakeoffPanel({ takeoffId, data, pending, onVerify, onNotesSaved, onSect
   );
 }
 
+// ── Add custom line item form ─────────────────────────────────────────────────
+
+interface AddLineItemFormProps {
+  withTradeName: boolean;
+  onCancel: () => void;
+  onSubmit: (values: { trade: string; description: string; unit: string; quantity: number }) => Promise<string | undefined>;
+}
+
+/** Inline form for adding a custom line item, optionally under a new trade name.
+ *  `onSubmit` returns a validation/save error to display, or undefined on success
+ *  (in which case the form closes itself). */
+function AddLineItemForm({ withTradeName, onCancel, onSubmit }: AddLineItemFormProps) {
+  const [trade, setTrade] = useState('');
+  const [description, setDescription] = useState('');
+  const [unit, setUnit] = useState('EA');
+  const [quantity, setQuantity] = useState('1');
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const submit = async () => {
+    setSubmitting(true);
+    try {
+      const err = await onSubmit({ trade, description, unit: unit.trim() || 'EA', quantity: parseFloat(quantity) });
+      if (err) setError(err);
+      else onCancel();
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-2 rounded-lg border border-indigo-200 bg-indigo-50/50 p-3">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+        {withTradeName && (
+          <div className="sm:col-span-3">
+            <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Trade</label>
+            <input
+              type="text"
+              value={trade}
+              onChange={(e) => setTrade(e.target.value)}
+              placeholder="New trade name"
+              autoFocus
+              className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+            />
+          </div>
+        )}
+        <div className={withTradeName ? 'sm:col-span-5' : 'sm:col-span-8'}>
+          <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Description</label>
+          <input
+            type="text"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="e.g. Permit fees"
+            autoFocus={!withTradeName}
+            onKeyDown={(e) => e.key === 'Enter' && submit()}
+            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+          />
+        </div>
+        <div className="sm:col-span-2">
+          <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Qty</label>
+          <input
+            type="number"
+            min={0}
+            step="any"
+            value={quantity}
+            onChange={(e) => setQuantity(e.target.value)}
+            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-right text-sm tabular-nums text-slate-700 focus:border-indigo-400 focus:outline-none"
+          />
+        </div>
+        <div className="sm:col-span-2">
+          <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Unit</label>
+          <input
+            type="text"
+            value={unit}
+            onChange={(e) => setUnit(e.target.value)}
+            placeholder="EA"
+            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+          />
+        </div>
+      </div>
+      {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={submitting}
+          className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-white disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={submit}
+          disabled={submitting}
+          className="rounded-lg bg-indigo-600 px-4 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-indigo-500 disabled:opacity-50"
+        >
+          {submitting ? 'Adding…' : 'Add item'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Materials tab panel ───────────────────────────────────────────────────────
 
 interface MaterialsSection {
@@ -714,6 +944,8 @@ interface MaterialsPanelProps {
   onVerify: (gap: string) => void;
   onUpdate: () => void;
   onConfigure: () => void;
+  /** Re-syncs the materials list with any custom items / strike-outs added on the Takeoff tab. */
+  onRegenerate: () => Promise<void>;
   onOverridesSaved: (overrides: Record<string, number>) => void;
   readOnly?: boolean;
 }
@@ -728,12 +960,27 @@ function MaterialsPanel({
   onVerify,
   onUpdate,
   onConfigure,
+  onRegenerate,
   onOverridesSaved,
   readOnly = false,
 }: MaterialsPanelProps) {
   const [overrides, setOverrides] = useState<Record<string, number>>(initialOverrides);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
+  const [regenerating, setRegenerating] = useState(false);
+  const [regenerateError, setRegenerateError] = useState<string | null>(null);
+
+  const handleRegenerate = async () => {
+    setRegenerating(true);
+    setRegenerateError(null);
+    try {
+      await onRegenerate();
+    } catch (err) {
+      setRegenerateError(err instanceof Error ? err.message : 'Regeneration failed.');
+    } finally {
+      setRegenerating(false);
+    }
+  };
 
   const handleSaveOverrides = async () => {
     setSaving(true);
@@ -799,17 +1046,28 @@ function MaterialsPanel({
           <UnverifiedWarning count={unverifiedCount} />
         </div>
       )}
-      <div className="flex items-center justify-between">
-        {!readOnly && (
-          <button
-            type="button"
-            onClick={onConfigure}
-            className="text-xs font-medium text-slate-400 hover:text-slate-600"
-          >
-            Edit categories
-          </button>
-        )}
-        {readOnly && <span />}
+      <div className="flex items-center justify-between gap-3">
+        {!readOnly ? (
+          <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={onConfigure}
+              className="text-xs font-medium text-slate-400 hover:text-slate-600"
+            >
+              Edit categories
+            </button>
+            <button
+              type="button"
+              onClick={handleRegenerate}
+              disabled={regenerating}
+              title="Pull in any custom items or strike-outs added on the Takeoff tab"
+              className="text-xs font-medium text-slate-400 hover:text-slate-600 disabled:cursor-wait disabled:opacity-50"
+            >
+              {regenerating ? 'Regenerating…' : 'Regenerate materials'}
+            </button>
+            {regenerateError && <span className="text-xs text-red-600">{regenerateError}</span>}
+          </div>
+        ) : <span />}
         {pending.size > 0 && (
           <UpdateButton
             count={pending.size}
@@ -3120,10 +3378,18 @@ export function TakeoffView({
 
   const availableTrades = localData.sections.map((s) => s.trade);
 
+  // Custom line items + strike-outs added on the Takeoff tab. Stored on the bid so the
+  // Materials and Pricing tabs stay consistent with whatever the GC has edited.
+  const customItems = localData.bid?.customItems ?? [];
+  const excludedItems = new Set(localData.bid?.excludedItems ?? []);
+
   const materialsSections: MaterialsSection[] | null = selectedMaterialTrades
-    ? visibleSections
+    ? mergeSections(visibleSections, customItems)
         .filter((s) => selectedMaterialTrades.includes(s.trade))
-        .map((s) => ({ trade: s.trade, items: s.items }))
+        .map((s) => ({
+          trade: s.trade,
+          items: s.items.filter((it) => !excludedItems.has(bidKey(s.trade, it.description))),
+        }))
     : null;
 
   const handleSave = (clarification: string, file: File | null) => {
@@ -3187,6 +3453,77 @@ export function TakeoffView({
       }
       return { ...prev, sections };
     });
+  };
+
+  // Persists a patch onto the bid, preserving every other bid field. `saveBid` replaces
+  // `data.bid` wholesale, so the current bid (if any) is always spread in first.
+  const persistBidPatch = async (patch: Partial<BidData>): Promise<void> => {
+    const current = localData.bid;
+    const saved = await saveBid(takeoff.id, {
+      prices: current?.prices ?? {},
+      aiPrices: current?.aiPrices,
+      aiPricesUpdatedAt: current?.aiPricesUpdatedAt,
+      aiPricesZipCode: current?.aiPricesZipCode,
+      delegations: current?.delegations,
+      excludedTrades: current?.excludedTrades,
+      excludedItems: current?.excludedItems,
+      customItems: current?.customItems,
+      overheadPct: current?.overheadPct ?? 10,
+      profitPct: current?.profitPct ?? 10,
+      contingencyPct: current?.contingencyPct ?? 5,
+      finalizedAt: current?.finalizedAt,
+      sentAt: current?.sentAt,
+      ...patch,
+    });
+    setLocalData(saved);
+  };
+
+  // Adds a user-typed line item to the takeoff (kept separate from the AI sections so the
+  // original is always recoverable). Returns a validation/save error, or undefined on success.
+  const addCustomItem = async (item: CustomLineItem): Promise<string | undefined> => {
+    const trade = item.trade.trim();
+    const description = item.description.trim();
+    if (!trade) return 'Enter a trade name.';
+    if (!description) return 'Enter a description.';
+    if (!(item.quantity > 0)) return 'Enter a quantity greater than 0.';
+    const exists =
+      customItems.some((c) => c.trade === trade && c.description === description) ||
+      localData.sections.some((s) => s.trade === trade && s.items.some((it) => it.description === description));
+    if (exists) return 'That trade already has an item with this description.';
+    try {
+      await persistBidPatch({
+        customItems: [...customItems, { trade, description, unit: item.unit.trim() || 'EA', quantity: item.quantity }],
+      });
+      return undefined;
+    } catch (err) {
+      return err instanceof Error ? err.message : 'Failed to add item.';
+    }
+  };
+
+  const removeCustomItem = async (trade: string, description: string): Promise<void> => {
+    await persistBidPatch({
+      customItems: customItems.filter((c) => !(c.trade === trade && c.description === description)),
+    });
+  };
+
+  // Struck-out items are dropped from the Materials/Pricing/Bid totals but never deleted,
+  // so the original AI takeoff is always recoverable.
+  const toggleExcludedItem = async (key: string): Promise<void> => {
+    const next = new Set(excludedItems);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    await persistBidPatch({ excludedItems: [...next] });
+  };
+
+  // Re-syncs the Materials list with the current Takeoff tab: pulls in any trade introduced
+  // by a custom item that isn't already part of the selected materials trades.
+  const handleRegenerateMaterials = async () => {
+    if (!selectedMaterialTrades) return;
+    const allTrades = mergeSections(localData.sections, customItems).map((s) => s.trade);
+    const next = [...new Set([...selectedMaterialTrades, ...allTrades])];
+    setSelectedMaterialTrades(next);
+    const saved = await saveMaterialsList(takeoff.id, next);
+    setLocalData(saved);
   };
 
   const openMaterialsModal = () => {
@@ -3299,6 +3636,11 @@ export function TakeoffView({
             onVerify={(gap) => setActiveGap(gap)}
             onNotesSaved={setLocalData}
             onSectionsUpdated={handleSectionsUpdated}
+            customItems={customItems}
+            excludedItems={excludedItems}
+            onAddCustomItem={addCustomItem}
+            onRemoveCustomItem={removeCustomItem}
+            onToggleExcludedItem={toggleExcludedItem}
             readOnly={locked}
             canEditNotes={!isSubView && !locked}
           />
@@ -3321,6 +3663,7 @@ export function TakeoffView({
               onVerify={(gap) => setActiveGap(gap)}
               onUpdate={handleUpdate}
               onConfigure={openMaterialsModal}
+              onRegenerate={handleRegenerateMaterials}
               initialOverrides={localData.materialsQuantityOverrides ?? {}}
               onOverridesSaved={(overrides) =>
                 setLocalData((prev) => ({ ...prev, materialsQuantityOverrides: overrides }))

@@ -56,7 +56,7 @@ export function SubcontractorFormModal({ initial, initialTrade, onSaved, onClose
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
+      <div className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white p-6 shadow-xl">
         <h2 className="text-base font-semibold text-slate-900">
           {initial ? 'Edit sub-contractor' : 'Add sub-contractor'}
         </h2>
