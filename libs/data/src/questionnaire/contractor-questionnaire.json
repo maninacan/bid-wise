@@ -18,6 +18,7 @@
         { "label": "Drywall / Plastering",       "value": "drywall",     "next": "done" },
         { "label": "Flooring",                   "value": "flooring",    "next": "done" },
         { "label": "Roofing",                    "value": "roofing",     "next": "done" },
+        { "label": "Siding & Exterior Trim",     "value": "siding-trim", "next": "done" },
         { "label": "Concrete / Masonry",         "value": "concrete",    "next": "done" },
         { "label": "Framing / Carpentry",        "value": "framing",     "next": "done" },
         { "label": "Tile / Stone",               "value": "tile",        "next": "done" },

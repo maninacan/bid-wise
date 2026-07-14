@@ -56,6 +56,10 @@ CRITICAL — the line items feed a materials list and a priced bid, so duplicate
 - Do not emit near-duplicate descriptions that refer to the same material (e.g. "2x4 stud" and "2x4 studs", or the same item with different wording). Pick one description per material.
 - Each description within a trade must be unique.
 
+Trade grouping — these two trades have specific, non-overlapping scope:
+- "Siding & Exterior Trim" — all exterior wall cladding and trim: siding (any material), stone/rock veneer, brick veneer, stucco, soffit, fascia, rain gutters, downspouts, exterior trim/casing around windows and doors, and house wrap / weather-resistive barrier.
+- "Concrete / Masonry" — structural concrete and masonry only: footings, foundation walls, slabs, CMU block, structural brick/block walls. Never include brick or stone/rock veneer or other cladding here — that belongs under "Siding & Exterior Trim".
+
 Use the unit of measure each item is conventionally bid in across the industry, as an uppercase abbreviation from this set ONLY:
 - SF — area work: drywall, flooring, paint/coatings, tile, insulation, siding, sheathing
 - SQ — roofing (1 SQ = 100 SF of roof)

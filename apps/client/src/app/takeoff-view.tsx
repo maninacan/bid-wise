@@ -1716,6 +1716,7 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
           if (parts.material + parts.labor > 0) prices[key] = parts;
         }
       }
+      await saveMaterialsOverrides(takeoffId, quantityOverrides);
       const saved = await saveBid(takeoffId, {
         prices,
         aiPrices: Object.keys(aiPrices).length > 0 ? aiPrices : undefined,
@@ -1833,7 +1834,7 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
         const sectionTotal = section.items.reduce((sum, item) => {
           const k = bidKey(section.trade, item.description);
           if (excludedItems.has(k)) return sum;
-          return sum + item.quantity * effectiveUnitPrice(k, section.trade);
+          return sum + effectiveQty(k, item.quantity) * effectiveUnitPrice(k, section.trade);
         }, 0);
         return (
           <div key={`${section.trade}-${i}`} className="mt-5">
@@ -1884,6 +1885,7 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                     <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                       <th className="py-1.5 pr-3 font-medium">Item</th>
                       <th className="w-12 py-1.5 pr-3 text-right font-medium">Qty</th>
+                      <th className="w-20 py-1.5 pr-3 text-right font-medium">Qty override</th>
                       <th className="w-12 py-1.5 pr-3 font-medium">Unit</th>
                       <th className="w-44 py-1.5 pr-3 text-right font-medium">Sub quote (mat / labor)</th>
                       <th className="w-24 py-1.5 text-right font-medium">Total</th>
@@ -1893,7 +1895,8 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                     {section.items.filter((item) => del.prices[bidKey(section.trade, item.description)] != null).map((item, i) => {
                       const key = bidKey(section.trade, item.description);
                       const parts = priceParts(del.prices[key]);
-                      const lineTotal = item.quantity * (parts.material + parts.labor);
+                      const qty = effectiveQty(key, item.quantity);
+                      const lineTotal = qty * (parts.material + parts.labor);
                       const itemExcluded = excludedItems.has(key);
                       return (
                         <tr key={i} className={`border-b border-slate-50 align-middle ${itemExcluded ? 'bg-rose-50/50' : ''}`}>
@@ -1907,7 +1910,28 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                             )}
                           </td>
                           <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
-                            {item.quantity.toLocaleString()}
+                            {quantityOverrides[key] != null ? (
+                              <span className="text-slate-300 line-through">{item.quantity.toLocaleString()}</span>
+                            ) : (
+                              item.quantity.toLocaleString()
+                            )}
+                          </td>
+                          <td className="py-1 pr-3 text-right">
+                            {readOnly ? (
+                              <span className="text-sm tabular-nums text-slate-500">
+                                {quantityOverrides[key] != null ? quantityOverrides[key].toLocaleString() : '—'}
+                              </span>
+                            ) : (
+                              <input
+                                type="number"
+                                min={0}
+                                step="any"
+                                value={quantityOverrides[key] ?? ''}
+                                onChange={(e) => setQuantityOverride(key, e.target.value)}
+                                placeholder="—"
+                                className="w-full rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:border-blue-400 focus:outline-none"
+                              />
+                            )}
                           </td>
                           <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                           <td className="py-1 pr-3">
@@ -1937,6 +1961,7 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                   <tr className="border-b border-slate-100 text-left text-xs uppercase text-slate-400">
                     <th className="py-1.5 pr-3 font-medium">Item</th>
                     <th className="w-12 py-1.5 pr-3 text-right font-medium">Qty</th>
+                    <th className="w-20 py-1.5 pr-3 text-right font-medium">Qty override</th>
                     <th className="w-12 py-1.5 pr-3 font-medium">Unit</th>
                     <th className="w-24 py-1.5 pr-3 text-right font-medium">AI (mat / labor)</th>
                     <th className="w-44 py-1.5 pr-3 text-right font-medium">Override (mat / labor)</th>
@@ -1948,7 +1973,8 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                     const key = bidKey(section.trade, item.description);
                     const ai = aiPrices[key];
                     const mp = manualPrices[key];
-                    const lineTotal = item.quantity * effectiveUnitPrice(key);
+                    const qty = effectiveQty(key, item.quantity);
+                    const lineTotal = qty * effectiveUnitPrice(key);
                     const itemExcluded = excludedItems.has(key);
                     const isCustom = !!item.isCustom;
                     return (
@@ -1978,7 +2004,28 @@ function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverride
                           )}
                         </td>
                         <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
-                          {item.quantity.toLocaleString()}
+                          {quantityOverrides[key] != null ? (
+                            <span className="text-slate-300 line-through">{item.quantity.toLocaleString()}</span>
+                          ) : (
+                            item.quantity.toLocaleString()
+                          )}
+                        </td>
+                        <td className="py-1 pr-3 text-right">
+                          {readOnly ? (
+                            <span className="text-sm tabular-nums text-slate-500">
+                              {quantityOverrides[key] != null ? quantityOverrides[key].toLocaleString() : '—'}
+                            </span>
+                          ) : (
+                            <input
+                              type="number"
+                              min={0}
+                              step="any"
+                              value={quantityOverrides[key] ?? ''}
+                              onChange={(e) => setQuantityOverride(key, e.target.value)}
+                              placeholder="—"
+                              className="w-full rounded border border-slate-200 bg-slate-50 px-2 py-0.5 text-right text-sm tabular-nums text-slate-700 placeholder:text-slate-300 focus:border-blue-400 focus:outline-none"
+                            />
+                          )}
                         </td>
                         <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                         <td className="py-1.5 pr-3">{aiCell(ai)}</td>
@@ -2110,6 +2157,8 @@ interface BidsPanelProps {
   takeoffId: string;
   sections: TakeoffSection[];
   initialBid?: BidData;
+  /** Quantity overrides set on the Pricing/Materials tabs (`${trade}::${description}` → qty). */
+  quantityOverrides?: Record<string, number>;
   pricingMatrix: PricingMatrix;
   subcontractors: Subcontractor[];
   onSaved: (data: TakeoffData) => void;
@@ -2121,6 +2170,7 @@ function BidsPanel({
   takeoffId,
   sections,
   initialBid,
+  quantityOverrides = {},
   pricingMatrix,
   subcontractors,
   onSaved,
@@ -2221,11 +2271,13 @@ function BidsPanel({
           .map((item) => {
             const key = bidKey(s.trade, item.description);
             const parts = effectiveParts(key, s.trade);
-            const lineMaterial = item.quantity * parts.material;
-            const lineLabor = item.quantity * parts.labor;
+            const qty = quantityOverrides[key] ?? item.quantity;
+            const lineMaterial = qty * parts.material;
+            const lineLabor = qty * parts.labor;
             return {
               ...item,
               key,
+              quantity: qty,
               parts,
               unitPrice: parts.material + parts.labor,
               source: priceSource(key, s.trade),
@@ -2774,10 +2826,12 @@ interface SubPricingPanelProps {
   takeoffId: string;
   sections: TakeoffSection[];
   delegations: Record<string, DelegationData>;
+  /** Quantity overrides set by the GC on the Pricing/Materials tabs. */
+  quantityOverrides?: Record<string, number>;
   onSaved: (updatedDelegations: Record<string, DelegationData>) => void;
 }
 
-function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPricingPanelProps) {
+function SubPricingPanel({ takeoffId, sections, delegations, quantityOverrides = {}, onSaved }: SubPricingPanelProps) {
   // The sub's quote, entered as separate material + labor components (strings for inputs).
   const [prices, setPrices] = useState<Record<string, { material: string; labor: string }>>(() => {
     const init: Record<string, { material: string; labor: string }> = {};
@@ -2996,7 +3050,7 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
         const sectionTotal = section.items.reduce((sum, item) => {
           const key = bidKey(section.trade, item.description);
           const p = effectiveParts(key, aiPrices);
-          return sum + item.quantity * (p.material + p.labor);
+          return sum + (quantityOverrides[key] ?? item.quantity) * (p.material + p.labor);
         }, 0);
 
         return (
@@ -3026,7 +3080,8 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
                   const mp = prices[key];
                   const ai = aiPrices[key];
                   const eff = effectiveParts(key, aiPrices);
-                  const lineTotal = item.quantity * (eff.material + eff.labor);
+                  const qty = quantityOverrides[key] ?? item.quantity;
+                  const lineTotal = qty * (eff.material + eff.labor);
                   return (
                     <tr key={i} className="border-b border-slate-50 align-middle">
                       <td className="py-1.5 pr-3 text-slate-700">
@@ -3036,7 +3091,7 @@ function SubPricingPanel({ takeoffId, sections, delegations, onSaved }: SubPrici
                         )}
                       </td>
                       <td className="py-1.5 pr-3 text-right tabular-nums text-slate-500">
-                        {item.quantity.toLocaleString()}
+                        {qty.toLocaleString()}
                       </td>
                       <td className="py-1.5 pr-3 text-slate-500"><Unit value={item.unit} /></td>
                       <td className="py-1.5 pr-3">
@@ -3107,11 +3162,13 @@ interface SubBidsPanelProps {
   takeoffId: string;
   sections: TakeoffSection[];
   delegations: Record<string, DelegationData>;
+  /** Quantity overrides set by the GC on the Pricing/Materials tabs. */
+  quantityOverrides?: Record<string, number>;
   gaps: (TakeoffGap | string)[];
   onApproved: (approvedAt: string) => void;
 }
 
-function SubBidsPanel({ takeoffId, sections, delegations, gaps, onApproved }: SubBidsPanelProps) {
+function SubBidsPanel({ takeoffId, sections, delegations, quantityOverrides = {}, gaps, onApproved }: SubBidsPanelProps) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [approving, setApproving] = useState(false);
   const [approveError, setApproveError] = useState<string | null>(null);
@@ -3146,7 +3203,8 @@ function SubBidsPanel({ takeoffId, sections, delegations, gaps, onApproved }: Su
       items: s.items.map((item) => {
         const key = bidKey(s.trade, item.description);
         const unitPrice = priceTotal(del?.prices[key]);
-        return { ...item, key, unitPrice, lineTotal: item.quantity * unitPrice };
+        const qty = quantityOverrides[key] ?? item.quantity;
+        return { ...item, key, quantity: qty, unitPrice, lineTotal: qty * unitPrice };
       }),
       get subtotal() {
         return this.items.reduce((sum, i) => sum + i.lineTotal, 0);
@@ -3696,6 +3754,7 @@ export function TakeoffView({
               takeoffId={takeoff.id}
               sections={visibleSections}
               delegations={subDelegations}
+              quantityOverrides={localData.materialsQuantityOverrides}
               onSaved={(updatedDelegations) =>
                 setLocalData((prev) => ({
                   ...prev,
@@ -3710,6 +3769,7 @@ export function TakeoffView({
               takeoffId={takeoff.id}
               sections={localData.sections}
               initialBid={localData.bid}
+              initialQuantityOverrides={localData.materialsQuantityOverrides}
               subcontractors={subcontractors}
               onSubcontractorAdded={onSubcontractorAdded}
               onSaved={setLocalData}
@@ -3724,6 +3784,7 @@ export function TakeoffView({
               takeoffId={takeoff.id}
               sections={visibleSections}
               delegations={subDelegations}
+              quantityOverrides={localData.materialsQuantityOverrides}
               gaps={visibleGaps}
               onApproved={(approvedAt) =>
                 setLocalData((prev) => {
@@ -3742,6 +3803,7 @@ export function TakeoffView({
               takeoffId={takeoff.id}
               sections={localData.sections}
               initialBid={localData.bid}
+              quantityOverrides={localData.materialsQuantityOverrides}
               pricingMatrix={pricingMatrix}
               subcontractors={subcontractors}
               onSaved={setLocalData}
