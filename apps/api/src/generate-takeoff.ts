@@ -56,9 +56,8 @@ CRITICAL — the line items feed a materials list and a priced bid, so duplicate
 - Do not emit near-duplicate descriptions that refer to the same material (e.g. "2x4 stud" and "2x4 studs", or the same item with different wording). Pick one description per material.
 - Each description within a trade must be unique.
 
-Trade grouping — these two trades have specific, non-overlapping scope:
-- "Siding & Exterior Trim" — all exterior wall cladding and trim: siding (any material), stone/rock veneer, brick veneer, stucco, soffit, fascia, rain gutters, downspouts, exterior trim/casing around windows and doors, and house wrap / weather-resistive barrier.
-- "Concrete / Masonry" — structural concrete and masonry only: footings, foundation walls, slabs, CMU block, structural brick/block walls. Never include brick or stone/rock veneer or other cladding here — that belongs under "Siding & Exterior Trim".
+CRITICAL — trade grouping for exterior cladding: if the plans show ANY siding, stone/rock veneer, brick veneer, stucco, soffit, fascia, rain gutters, downspouts, exterior trim/casing around windows and doors, or house wrap / weather-resistive barrier, you MUST create a dedicated trade section named exactly "Siding & Exterior Trim" containing those items. Do NOT fold them into "Framing", "Finish Work", "Roofing", or any other trade, even though that grouping might otherwise feel natural — this is a hard requirement, not a suggestion. "Siding & Exterior Trim" must appear as one of your returned sections whenever any of these materials are present.
+"Concrete / Masonry" is structural only — footings, foundation walls, slabs, CMU block, structural brick/block walls. Never put brick or stone/rock veneer or other cladding there; that always belongs under "Siding & Exterior Trim".
 
 Use the unit of measure each item is conventionally bid in across the industry, as an uppercase abbreviation from this set ONLY:
 - SF — area work: drywall, flooring, paint/coatings, tile, insulation, siding, sheathing
@@ -84,6 +83,8 @@ For each line item, classify the source:
 Identify gaps where information is missing or ambiguous — things a contractor would need to clarify before confidently pricing the job.
 
 Also populate "acronyms": list every abbreviation or acronym you used anywhere in this takeoff — every unit of measure, plus any acronyms in line-item descriptions — each paired with its full plain-English meaning (e.g. "MO" → "Month", "GFCI" → "Ground-fault circuit interrupter"). Do not include plain words that aren't abbreviations.
+
+Before calling submit_takeoff, double-check: if any siding, veneer, stucco, soffit, fascia, gutters, downspouts, exterior trim, or house wrap appear in your sections, confirm they're grouped under their own "Siding & Exterior Trim" section rather than scattered into Framing, Finish Work, or Roofing.
 
 Once your analysis is complete, call submit_takeoff with all the structured results.`;
 
