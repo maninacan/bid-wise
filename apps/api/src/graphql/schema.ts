@@ -10,15 +10,16 @@ export const typeDefs = `#graphql
     "Current prepaid credit balance for the signed-in user, in cents."
     creditBalanceCents: Int!
 
-    "Tier, price, and whether a takeoff's bid is already paid for — drives the finalize UI."
+    "Square footage, price, and whether a takeoff's bid is already paid for — drives the Materials/Pricing/Bid payment gate."
     bidQuote(takeoffId: ID!): BidQuote!
   }
 
   type BidQuote {
-    "simple | standard | complex"
-    tier: String!
+    "Total square footage across the takeoff's areas. 0 if the bid is already paid (no new charge is being computed)."
+    squareFeet: Int!
+    "Price in cents: max($15, squareFeet * 5 cents). 0 if the bid is already paid."
     priceCents: Int!
-    "True if this bid was already charged (re-finalizing won't charge again)."
+    "True if this bid was already charged — Materials/Pricing/Bid are unlocked."
     alreadyPaid: Boolean!
     balanceCents: Int!
   }
@@ -88,6 +89,10 @@ export const typeDefs = `#graphql
     ok: Boolean!
   }
 
+  type PayResult {
+    balanceCents: Int!
+  }
+
   type Mutation {
     "Recompute takeoff line items from a batch of gap clarifications."
     clarifyTakeoff(takeoffId: ID!, clarifications: [ClarificationInput!]!): ClarifyResult!
@@ -113,7 +118,10 @@ export const typeDefs = `#graphql
     "Confirm a returned Checkout session and credit the balance (idempotent)."
     confirmTopup(sessionId: String!): CreditResult!
 
-    "Charge the bid's tier price against credits (once per bid) and finalize it."
+    "Charges the prepaid credit balance for this takeoff's square footage (once per takeoff) and unlocks Materials, Pricing, and Bid."
+    payForTakeoff(takeoffId: ID!): PayResult!
+
+    "Stamp a paid bid as finalized (locked) — no charge; payment already happened via payForTakeoff."
     finalizeBid(takeoffId: ID!): FinalizeResult!
   }
 `;

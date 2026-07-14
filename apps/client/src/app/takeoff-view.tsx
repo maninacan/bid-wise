@@ -18,7 +18,7 @@ import type {
   TakeoffItem,
   TakeoffSection,
 } from '../lib/supabase';
-import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, priceParts, priceTotal, recalculateMaterials, saveBid, saveLineItemNotes, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
+import { approveSubBid, bidQuote, clarifyTakeoff, finalizeBid, getLocalPricing, InsufficientCreditsError, payForTakeoff, priceParts, priceTotal, recalculateMaterials, saveBid, saveLineItemNotes, saveMaterialsList, saveMaterialsOverrides, saveSubPrices, shareBidPdf, unfinalizeBid, type BidQuote } from '../lib/supabase';
 import { notifyCreditsChanged } from './billing-screen';
 import { SubcontractorFormModal } from './subs-screen';
 
@@ -578,7 +578,7 @@ function TakeoffPanel({
             disabled={recalculating || assumptionCount === 0}
             className="shrink-0 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-300"
           >
-            {recalculating ? 'Recalculating…' : 'Recalculate materials'}
+            {recalculating ? 'Recalculating…' : 'Recalculate'}
           </button>
         </div>
       )}
@@ -2361,23 +2361,11 @@ function BidsPanel({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<Date | null>(null);
 
-  const navigate = useNavigate();
   const [finalizeConfirmOpen, setFinalizeConfirmOpen] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [finalizeError, setFinalizeError] = useState<string | null>(null);
-  const [quote, setQuote] = useState<BidQuote | null>(null);
-  const [insufficient, setInsufficient] = useState(false);
   const [unfinalizing, setUnfinalizing] = useState(false);
   const [unfinalizeError, setUnfinalizeError] = useState<string | null>(null);
-
-  // Load the tier/price/balance quote when the finalize modal opens.
-  useEffect(() => {
-    if (!finalizeConfirmOpen) return;
-    setQuote(null);
-    setInsufficient(false);
-    setFinalizeError(null);
-    bidQuote(takeoffId).then(setQuote).catch(() => setQuote(null));
-  }, [finalizeConfirmOpen, takeoffId]);
 
   const [shareOpen, setShareOpen] = useState(false);
   const [shareEmail, setShareEmail] = useState('');
@@ -2517,18 +2505,12 @@ function BidsPanel({
   const handleFinalize = async () => {
     setFinalizing(true);
     setFinalizeError(null);
-    setInsufficient(false);
     try {
       const saved = await finalizeBid(takeoffId);
       onSaved(saved);
-      notifyCreditsChanged(); // refresh the header balance after the charge
       setFinalizeConfirmOpen(false);
     } catch (err) {
-      if (err instanceof InsufficientCreditsError) {
-        setInsufficient(true);
-      } else {
-        setFinalizeError(err instanceof Error ? err.message : 'Finalize failed.');
-      }
+      setFinalizeError(err instanceof Error ? err.message : 'Finalize failed.');
     } finally {
       setFinalizing(false);
     }
@@ -2829,37 +2811,6 @@ function BidsPanel({
               un-finalize to make changes any time before the bid is sent to the customer.
             </p>
 
-            {/* Pricing summary from the quote */}
-            {quote && (
-              <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm">
-                {quote.alreadyPaid ? (
-                  <p className="text-slate-600">
-                    This bid is already paid for — finalizing again won&rsquo;t charge you.
-                  </p>
-                ) : (
-                  <>
-                    <div className="flex items-center justify-between">
-                      <span className="text-slate-600">
-                        Charge (<span className="capitalize">{quote.tier}</span> bid)
-                      </span>
-                      <span className="font-semibold tabular-nums text-slate-900">
-                        {fmt(quote.priceCents / 100)}
-                      </span>
-                    </div>
-                    <div className="mt-1 flex items-center justify-between text-xs text-slate-400">
-                      <span>Credit balance</span>
-                      <span className="tabular-nums">{fmt(quote.balanceCents / 100)}</span>
-                    </div>
-                  </>
-                )}
-              </div>
-            )}
-
-            {insufficient && (
-              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-                Not enough credits to finalize this bid. Add credits and try again.
-              </div>
-            )}
             {finalizeError && (
               <p className="mt-3 text-sm text-red-600">{finalizeError}</p>
             )}
@@ -2873,28 +2824,14 @@ function BidsPanel({
               >
                 Cancel
               </button>
-              {insufficient ? (
-                <button
-                  type="button"
-                  onClick={() => navigate('/billing')}
-                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-500"
-                >
-                  Buy credits
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={handleFinalize}
-                  disabled={finalizing}
-                  className="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white hover:bg-green-500 disabled:cursor-wait disabled:bg-slate-300"
-                >
-                  {finalizing
-                    ? 'Finalizing…'
-                    : quote && !quote.alreadyPaid
-                    ? `Pay ${fmt(quote.priceCents / 100)} & finalize`
-                    : 'Yes, finalize'}
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={handleFinalize}
+                disabled={finalizing}
+                className="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white hover:bg-green-500 disabled:cursor-wait disabled:bg-slate-300"
+              >
+                {finalizing ? 'Finalizing…' : 'Yes, finalize'}
+              </button>
             </div>
           </div>
         </div>
@@ -3534,6 +3471,109 @@ function SubBidsPanel({ takeoffId, sections, delegations, quantityOverrides = {}
   );
 }
 
+// ── Payment gate ──────────────────────────────────────────────────────────────
+// Shown in place of Materials/Pricing/Bid until the takeoff's square footage has been paid
+// for. Takeoff-tab work (assumptions, custom items, strike-outs, Recalculate) stays free —
+// square footage is only known after the AI reads the plan, so payment can't happen sooner.
+
+interface PaymentGateProps {
+  takeoffId: string;
+  quote: BidQuote | null;
+  quoteLoading: boolean;
+  isSubView: boolean;
+  onPaid: () => void;
+}
+
+function PaymentGate({ takeoffId, quote, quoteLoading, isSubView, onPaid }: PaymentGateProps) {
+  const navigate = useNavigate();
+  const [paying, setPaying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [insufficient, setInsufficient] = useState(false);
+
+  if (quoteLoading) {
+    return (
+      <div className="flex flex-col items-center py-14 text-center">
+        <p className="text-sm text-slate-500">Loading…</p>
+      </div>
+    );
+  }
+
+  if (isSubView) {
+    return (
+      <div className="flex flex-col items-center py-14 text-center">
+        <p className="text-sm text-slate-500">
+          The general contractor hasn&rsquo;t unlocked pricing for this project yet.
+        </p>
+      </div>
+    );
+  }
+
+  const handlePay = async () => {
+    setPaying(true);
+    setError(null);
+    setInsufficient(false);
+    try {
+      await payForTakeoff(takeoffId);
+      notifyCreditsChanged(); // refresh the header balance after the charge
+      onPaid();
+    } catch (err) {
+      if (err instanceof InsufficientCreditsError) {
+        setInsufficient(true);
+      } else {
+        setError(err instanceof Error ? err.message : 'Payment failed.');
+      }
+    } finally {
+      setPaying(false);
+    }
+  };
+
+  return (
+    <div className="mt-6 flex flex-col items-center rounded-xl border border-slate-200 bg-slate-50 px-6 py-14 text-center">
+      <p className="text-sm font-medium text-slate-700">
+        {quote ? (
+          <>
+            This job is {quote.squareFeet.toLocaleString()} sq ft — unlock Materials,
+            Pricing, and the final Bid for {fmt(quote.priceCents / 100)}.
+          </>
+        ) : (
+          'Unlock Materials, Pricing, and the final Bid to continue.'
+        )}
+      </p>
+      {quote && (
+        <p className="mt-1 text-xs text-slate-400">
+          Credit balance: {fmt(quote.balanceCents / 100)}
+        </p>
+      )}
+      {insufficient && (
+        <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          Not enough credits to unlock this bid. Add credits and try again.
+        </div>
+      )}
+      {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
+      <div className="mt-5 flex gap-3">
+        {insufficient ? (
+          <button
+            type="button"
+            onClick={() => navigate('/billing')}
+            className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500"
+          >
+            Buy credits
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={handlePay}
+            disabled={paying || !quote}
+            className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:bg-slate-300"
+          >
+            {paying ? 'Paying…' : quote ? `Pay ${fmt(quote.priceCents / 100)}` : 'Pay to unlock'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── TakeoffView ───────────────────────────────────────────────────────────────
 
 const EMPTY_MATRIX: PricingMatrix = { unitDefaults: {}, tradeOverrides: [] };
@@ -3561,6 +3601,23 @@ export function TakeoffView({
   mySubIds = [],
 }: TakeoffViewProps) {
   const [localData, setLocalData] = useState<TakeoffData>(takeoff.data);
+
+  // Payment gate: Materials, Pricing, and Bid stay locked until this takeoff's square
+  // footage has been paid for. Loaded once on mount and refreshed after a successful pay.
+  const [quote, setQuote] = useState<BidQuote | null>(null);
+  const [quoteLoading, setQuoteLoading] = useState(true);
+  const loadQuote = () => {
+    setQuoteLoading(true);
+    bidQuote(takeoff.id)
+      .then(setQuote)
+      .catch(() => setQuote(null))
+      .finally(() => setQuoteLoading(false));
+  };
+  useEffect(() => {
+    loadQuote();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [takeoff.id]);
+  const paid = quote?.alreadyPaid ?? false;
 
   // Determine if the current user is viewing as a subcontractor.
   const mySubIdSet = new Set(mySubIds);
@@ -3893,7 +3950,9 @@ export function TakeoffView({
         )}
 
         {activeTab === 'materials' && (
-          isSubView && !materialsSections ? (
+          !paid ? (
+            <PaymentGate takeoffId={takeoff.id} quote={quote} quoteLoading={quoteLoading} isSubView={isSubView} onPaid={loadQuote} />
+          ) : isSubView && !materialsSections ? (
             <div className="flex flex-col items-center py-14 text-center">
               <p className="text-sm text-slate-500">
                 No materials list has been generated for this project yet.
@@ -3920,7 +3979,9 @@ export function TakeoffView({
         )}
 
         {activeTab === 'pricing' && (
-          isSubView ? (
+          !paid ? (
+            <PaymentGate takeoffId={takeoff.id} quote={quote} quoteLoading={quoteLoading} isSubView={isSubView} onPaid={loadQuote} />
+          ) : isSubView ? (
             <SubPricingPanel
               takeoffId={takeoff.id}
               sections={visibleSections}
@@ -3950,7 +4011,9 @@ export function TakeoffView({
         )}
 
         {activeTab === 'bids' && (
-          isSubView ? (
+          !paid ? (
+            <PaymentGate takeoffId={takeoff.id} quote={quote} quoteLoading={quoteLoading} isSubView={isSubView} onPaid={loadQuote} />
+          ) : isSubView ? (
             <SubBidsPanel
               takeoffId={takeoff.id}
               sections={visibleSections}

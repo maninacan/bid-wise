@@ -774,20 +774,20 @@ const FINALIZE_BID = gql`
   }
 `;
 
-/** Thrown by finalizeBid when the user's credit balance can't cover the bid's tier price. */
+/** Thrown by payForTakeoff when the user's credit balance can't cover the bid's price. */
 export class InsufficientCreditsError extends Error {
   constructor(
-    readonly tier: string,
+    readonly squareFeet: number,
     readonly priceCents: number,
     readonly balanceCents: number,
   ) {
-    super('Not enough credits to finalize this bid.');
+    super('Not enough credits to unlock this bid.');
     this.name = 'InsufficientCreditsError';
   }
 }
 
-/** Charges the bid's tier price against the user's credits (once per bid) and stamps
- *  finalizedAt server-side. Throws InsufficientCreditsError if the balance is too low. */
+/** Stamps finalizedAt server-side, locking the bid. Payment already happened earlier via
+ *  payForTakeoff — this never charges anything. */
 export async function finalizeBid(takeoffId: string): Promise<TakeoffData> {
   try {
     const { data } = await apolloClient.mutate<{ finalizeBid: { data: TakeoffData; balanceCents: number } }>({
@@ -797,14 +797,6 @@ export async function finalizeBid(takeoffId: string): Promise<TakeoffData> {
     });
     return data!.finalizeBid.data;
   } catch (error) {
-    const ext = gqlExtensions(error);
-    if (ext?.code === 'INSUFFICIENT_CREDITS') {
-      throw new InsufficientCreditsError(
-        String(ext.tier),
-        Number(ext.priceCents),
-        Number(ext.balanceCents),
-      );
-    }
     throw new Error(gqlErrorMessage(error, 'Finalize failed.'));
   }
 }
@@ -868,7 +860,7 @@ export async function shareBidPdf(
 // ── Billing / credits ─────────────────────────────────────────────────────────
 
 export interface BidQuote {
-  tier: string;
+  squareFeet: number;
   priceCents: number;
   alreadyPaid: boolean;
   balanceCents: number;
@@ -887,7 +879,7 @@ export async function getCreditBalanceCents(): Promise<number> {
 const BID_QUOTE = gql`
   query BidQuote($takeoffId: ID!) {
     bidQuote(takeoffId: $takeoffId) {
-      tier
+      squareFeet
       priceCents
       alreadyPaid
       balanceCents
@@ -895,7 +887,8 @@ const BID_QUOTE = gql`
   }
 `;
 
-/** Tier, price, paid-status and balance for a bid — drives the finalize confirmation UI. */
+/** Square footage, price, paid-status and balance for a bid — drives the payment gate
+ *  in front of Materials/Pricing/Bid. */
 export async function bidQuote(takeoffId: string): Promise<BidQuote> {
   try {
     const { data } = await apolloClient.query<{ bidQuote: BidQuote }>({
@@ -907,6 +900,38 @@ export async function bidQuote(takeoffId: string): Promise<BidQuote> {
     return data!.bidQuote;
   } catch (error) {
     throw new Error(gqlErrorMessage(error, 'Could not load bid pricing.'));
+  }
+}
+
+const PAY_FOR_TAKEOFF = gql`
+  mutation PayForTakeoff($takeoffId: ID!) {
+    payForTakeoff(takeoffId: $takeoffId) {
+      balanceCents
+    }
+  }
+`;
+
+/** Charges the prepaid credit balance for this takeoff's square footage (once per
+ *  takeoff) and unlocks Materials, Pricing, and Bid. Throws InsufficientCreditsError if
+ *  the balance is too low. */
+export async function payForTakeoff(takeoffId: string): Promise<{ balanceCents: number }> {
+  try {
+    const { data } = await apolloClient.mutate<{ payForTakeoff: { balanceCents: number } }>({
+      mutation: PAY_FOR_TAKEOFF,
+      variables: { takeoffId },
+      context: await authContext(),
+    });
+    return data!.payForTakeoff;
+  } catch (error) {
+    const ext = gqlExtensions(error);
+    if (ext?.code === 'INSUFFICIENT_CREDITS') {
+      throw new InsufficientCreditsError(
+        Number(ext.squareFeet),
+        Number(ext.priceCents),
+        Number(ext.balanceCents),
+      );
+    }
+    throw new Error(gqlErrorMessage(error, 'Payment failed.'));
   }
 }
 

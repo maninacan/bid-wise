@@ -98,10 +98,11 @@ export function BillingScreen() {
     <section className="mt-10 w-full max-w-xl">
       <h1 className="text-xl font-semibold text-slate-800">Credits</h1>
       <p className="mt-1 text-sm text-slate-500">
-        Prepay for credits, then finalize bids as you go. Each finalized bid is charged by
-        complexity: <span className="font-medium text-slate-700">Simple $15</span> ·{' '}
-        <span className="font-medium text-slate-700">Standard $25</span> ·{' '}
-        <span className="font-medium text-slate-700">Complex $45</span>.
+        Prepay for credits, then generate takeoffs for free. Once a takeoff is generated,
+        unlocking pricing, materials, and the final bid costs{' '}
+        <span className="font-medium text-slate-700">$0.05 per square foot</span> of the
+        plan (minimum <span className="font-medium text-slate-700">$15</span>) — charged
+        once per project.
       </p>
 
       {notice && (

@@ -4,13 +4,30 @@ import { getAnthropic, CLAUDE_MODEL } from '../lib/anthropic';
 import { trackUsage } from '../track-usage';
 import { generateBidPdf, type BidTakeoffData } from '../bid-pdf';
 import { getStripe, appUrl } from '../lib/stripe';
-import { tierFor, priceCentsFor } from '../lib/pricing';
-import { getBalanceCents, takeoffTokens, creditTopup } from '../billing';
+import {
+  totalSquareFeetRaw,
+  priceCentsForSquareFeet,
+  displaySquareFeet,
+  INVALID_SQUARE_FEET_MESSAGE,
+} from '../lib/pricing';
+import { getBalanceCents, isTakeoffPaid, creditTopup } from '../billing';
 import { requireUser, type GqlContext } from './context';
 
 const bad = (message: string) => new GraphQLError(message, { extensions: { code: 'BAD_REQUEST' } });
 
 const UNIQUE_VIOLATION = '23505';
+
+const invalidSquareFeet = () =>
+  new GraphQLError(INVALID_SQUARE_FEET_MESSAGE, { extensions: { code: 'INVALID_SQUARE_FOOTAGE' } });
+
+/** Blocks Materials/Pricing/Bid-adjacent resolvers until the takeoff has been paid for. */
+async function requirePaid(ctx: GqlContext, takeoffId: string): Promise<void> {
+  if (!(await isTakeoffPaid(ctx.supabase, takeoffId))) {
+    throw new GraphQLError('This bid must be paid for before continuing — pay from the Takeoff tab first.', {
+      extensions: { code: 'PAYMENT_REQUIRED' },
+    });
+  }
+}
 
 // Despite being asked for JSON only, the model sometimes prepends narration ("I'll ...")
 // or wraps the reply in a markdown fence. Slice out the outermost {...} rather than
@@ -261,6 +278,7 @@ async function getLocalPricing(
   // Resolve plan_id from takeoff if provided (service role — works for subs too).
   let plan_id: string | null = null;
   if (takeoffId) {
+    await requirePaid(ctx, takeoffId);
     const { data: takeoff } = await ctx.supabase.from('takeoffs').select('plan_id').eq('id', takeoffId).single();
     if (takeoff) plan_id = takeoff.plan_id;
   }
@@ -377,6 +395,7 @@ async function saveSubPrices(
   const user = await requireUser(ctx);
   const { takeoffId, delegations: subDelegations } = args;
   if (!takeoffId || !subDelegations) throw bad('takeoffId and delegations are required.');
+  await requirePaid(ctx, takeoffId);
 
   const { data: subs, error: subsError } = await ctx.supabase
     .from('subcontractors')
@@ -430,6 +449,7 @@ async function approveSubBid(
   const user = await requireUser(ctx);
   const { takeoffId, trades } = args;
   if (!takeoffId || !Array.isArray(trades) || trades.length === 0) throw bad('takeoffId and trades are required.');
+  await requirePaid(ctx, takeoffId);
 
   const { data: subs, error: subsError } = await ctx.supabase
     .from('subcontractors')
@@ -481,6 +501,7 @@ async function shareBidPdf(
   const { takeoffId, email, phone, sharingMode } = args;
   if (!takeoffId) throw bad('takeoffId is required.');
   if (!email && !phone) throw bad('At least one of email or phone is required.');
+  await requirePaid(ctx, takeoffId);
 
   const { data: row, error: fetchError } = await ctx.supabase
     .from('takeoffs')
@@ -599,17 +620,54 @@ async function bidQuote(
   _: unknown,
   { takeoffId }: { takeoffId: string },
   ctx: GqlContext,
-): Promise<{ tier: string; priceCents: number; alreadyPaid: boolean; balanceCents: number }> {
+): Promise<{ squareFeet: number; priceCents: number; alreadyPaid: boolean; balanceCents: number }> {
   const user = await requireUser(ctx);
   const { data: takeoff } = await ctx.supabase
     .from('takeoffs')
-    .select('id')
+    .select('id, data')
     .eq('id', takeoffId)
     .eq('user_id', user.id)
     .maybeSingle();
   if (!takeoff) throw bad('Takeoff not found.');
 
-  const tokens = await takeoffTokens(ctx.supabase, takeoffId);
+  const { data: existingCharge } = await ctx.supabase
+    .from('credit_transactions')
+    .select('id')
+    .eq('takeoff_id', takeoffId)
+    .eq('kind', 'charge')
+    .maybeSingle();
+  const alreadyPaid = !!existingCharge;
+
+  const rawSqFt = totalSquareFeetRaw((takeoff.data as { areas?: { squareFeet?: number }[] })?.areas);
+  let priceCents = 0;
+  if (!alreadyPaid) {
+    const computed = priceCentsForSquareFeet(rawSqFt);
+    if (computed == null) throw invalidSquareFeet();
+    priceCents = computed;
+  }
+
+  return {
+    squareFeet: displaySquareFeet(rawSqFt),
+    priceCents,
+    alreadyPaid,
+    balanceCents: await getBalanceCents(ctx.supabase, user.id),
+  };
+}
+
+async function payForTakeoff(
+  _: unknown,
+  { takeoffId }: { takeoffId: string },
+  ctx: GqlContext,
+): Promise<{ balanceCents: number }> {
+  const user = await requireUser(ctx);
+  const { data: takeoff } = await ctx.supabase
+    .from('takeoffs')
+    .select('id, data')
+    .eq('id', takeoffId)
+    .eq('user_id', user.id)
+    .maybeSingle();
+  if (!takeoff) throw bad('Takeoff not found.');
+
   const { data: existingCharge } = await ctx.supabase
     .from('credit_transactions')
     .select('id')
@@ -617,12 +675,34 @@ async function bidQuote(
     .eq('kind', 'charge')
     .maybeSingle();
 
-  return {
-    tier: tierFor(tokens),
-    priceCents: priceCentsFor(tokens),
-    alreadyPaid: !!existingCharge,
-    balanceCents: await getBalanceCents(ctx.supabase, user.id),
-  };
+  if (!existingCharge) {
+    const rawSqFt = totalSquareFeetRaw((takeoff.data as { areas?: { squareFeet?: number }[] })?.areas);
+    const priceCents = priceCentsForSquareFeet(rawSqFt);
+    if (priceCents == null) throw invalidSquareFeet();
+
+    const balance = await getBalanceCents(ctx.supabase, user.id);
+    if (balance < priceCents) {
+      throw new GraphQLError('Not enough credits to unlock this bid.', {
+        extensions: {
+          code: 'INSUFFICIENT_CREDITS',
+          squareFeet: displaySquareFeet(rawSqFt),
+          priceCents,
+          balanceCents: balance,
+        },
+      });
+    }
+    const { error: chargeErr } = await ctx.supabase.from('credit_transactions').insert({
+      user_id: user.id,
+      kind: 'charge',
+      amount_cents: -priceCents,
+      takeoff_id: takeoffId,
+      tier: 'sqft',
+    });
+    // Unique violation → a concurrent payment already charged it; treat as success.
+    if (chargeErr && (chargeErr as { code?: string }).code !== UNIQUE_VIOLATION) throw chargeErr;
+  }
+
+  return { balanceCents: await getBalanceCents(ctx.supabase, user.id) };
 }
 
 async function createCreditCheckout(
@@ -689,33 +769,13 @@ async function finalizeBid(
   const data = takeoff.data as { bid?: { finalizedAt?: string } };
   if (!data.bid) throw bad('Add pricing before finalizing.');
 
-  // Charge once per bid. If a charge already exists, re-finalizing is free.
-  const { data: existingCharge } = await ctx.supabase
-    .from('credit_transactions')
-    .select('id')
-    .eq('takeoff_id', takeoffId)
-    .eq('kind', 'charge')
-    .maybeSingle();
-
-  if (!existingCharge) {
-    const tokens = await takeoffTokens(ctx.supabase, takeoffId);
-    const tier = tierFor(tokens);
-    const priceCents = priceCentsFor(tokens);
-    const balance = await getBalanceCents(ctx.supabase, user.id);
-    if (balance < priceCents) {
-      throw new GraphQLError('Not enough credits to finalize this bid.', {
-        extensions: { code: 'INSUFFICIENT_CREDITS', tier, priceCents, balanceCents: balance },
-      });
-    }
-    const { error: chargeErr } = await ctx.supabase.from('credit_transactions').insert({
-      user_id: user.id,
-      kind: 'charge',
-      amount_cents: -priceCents,
-      takeoff_id: takeoffId,
-      tier,
+  // Payment now happens earlier (payForTakeoff, before Materials/Pricing/Bid unlock) — this
+  // is a defense-in-depth check, not the primary gate. The client should never let someone
+  // reach Finalize without having paid, but never trust the client alone.
+  if (!(await isTakeoffPaid(ctx.supabase, takeoffId))) {
+    throw new GraphQLError('This bid must be paid for before it can be finalized.', {
+      extensions: { code: 'PAYMENT_REQUIRED' },
     });
-    // Unique violation → a concurrent finalize already charged it; proceed to stamp.
-    if (chargeErr && (chargeErr as { code?: string }).code !== UNIQUE_VIOLATION) throw chargeErr;
   }
 
   data.bid.finalizedAt = new Date().toISOString();
@@ -746,6 +806,7 @@ export const resolvers = {
     shareBidPdf,
     createCreditCheckout,
     confirmTopup,
+    payForTakeoff,
     finalizeBid,
   },
 };

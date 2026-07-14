@@ -16,15 +16,16 @@ export async function getBalanceCents(supabase: SupabaseClient, userId: string):
   return data?.balance_cents ?? 0;
 }
 
-/** Total AI tokens spent on a takeoff (input + output) from the rollup view. */
-export async function takeoffTokens(supabase: SupabaseClient, takeoffId: string): Promise<number> {
+/** True once a takeoff has been paid for (a `charge` row exists) via payForTakeoff. */
+export async function isTakeoffPaid(supabase: SupabaseClient, takeoffId: string): Promise<boolean> {
   const { data, error } = await supabase
-    .from('takeoff_token_usage')
-    .select('total_tokens')
+    .from('credit_transactions')
+    .select('id')
     .eq('takeoff_id', takeoffId)
+    .eq('kind', 'charge')
     .maybeSingle();
   if (error) throw error;
-  return data?.total_tokens ?? 0;
+  return !!data;
 }
 
 /** Idempotently credit a paid Stripe Checkout session to the user's balance. Safe to call
