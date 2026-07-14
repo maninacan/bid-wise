@@ -532,8 +532,22 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
   }
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// How long to wait for the owning process to react to cancel_requested before assuming
+// it's gone (e.g. killed by a server restart mid-run) and force-finalizing the job here.
+// The owning process polls cancel_requested every 3s, so this gives ~2-3x margin.
+const CANCEL_GRACE_MS = 8000;
+const CANCEL_POLL_MS = 1000;
+
 /** Requests cancellation of the running takeoff for a plan. Flips cancel_requested on the
- *  job row; the streaming handler polls it, aborts the model, and finalizes as 'canceled'. */
+ *  job row; the streaming handler polls it, aborts the model, and finalizes as 'canceled'.
+ *
+ *  That only works if the process running the generation is still alive to notice the
+ *  flag. If it died (e.g. a server restart mid-run), nothing would ever act on it and the
+ *  row would stay 'running' forever — reattaching as "still running" on every refresh and
+ *  blocking new runs for the plan. So after flipping the flag, wait briefly for the job to
+ *  leave 'running' on its own; if it doesn't, force-finalize it as 'canceled' here instead. */
 export async function cancelTakeoffHandler(req: Request, res: Response): Promise<void> {
   const user = await getUserFromAuthHeader(req.headers.authorization ?? '');
   if (!user) {
@@ -545,16 +559,46 @@ export async function cancelTakeoffHandler(req: Request, res: Response): Promise
     res.status(400).json({ error: 'plan_id is required.' });
     return;
   }
-  const { error } = await supabaseAdmin
+
+  const { data: job, error } = await supabaseAdmin
     .from('takeoff_jobs')
     .update({ cancel_requested: true, updated_at: new Date().toISOString() })
     .eq('user_id', user.id)
     .eq('plan_id', plan_id)
-    .eq('status', 'running');
+    .eq('status', 'running')
+    .select('id')
+    .maybeSingle();
   if (error) {
     console.error('[cancel-takeoff] update failed:', error.message);
     res.status(500).json({ error: 'Failed to cancel takeoff.' });
     return;
   }
+  if (!job) {
+    // Nothing running for this plan — already finished, errored, or canceled elsewhere.
+    res.json({ ok: true });
+    return;
+  }
+
+  const deadline = Date.now() + CANCEL_GRACE_MS;
+  while (Date.now() < deadline) {
+    await sleep(CANCEL_POLL_MS);
+    const { data: current } = await supabaseAdmin
+      .from('takeoff_jobs')
+      .select('status')
+      .eq('id', job.id)
+      .single();
+    if (current?.status !== 'running') {
+      res.json({ ok: true });
+      return;
+    }
+  }
+
+  // Still 'running' after the grace period: the owning process is gone. The status guard
+  // avoids clobbering a legitimate finish that lands between our last poll and this update.
+  await supabaseAdmin
+    .from('takeoff_jobs')
+    .update({ status: 'canceled', updated_at: new Date().toISOString() })
+    .eq('id', job.id)
+    .eq('status', 'running');
   res.json({ ok: true });
 }
