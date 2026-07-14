@@ -891,13 +891,15 @@ function AddLineItemForm({ withTradeName, onCancel, onSubmit }: AddLineItemFormP
         </div>
         <div className="sm:col-span-2">
           <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Unit</label>
-          <input
-            type="text"
+          <select
             value={unit}
             onChange={(e) => setUnit(e.target.value)}
-            placeholder="EA"
-            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
-          />
+            className="mt-0.5 w-full rounded border border-slate-200 bg-white px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+          >
+            {Object.entries(UNIT_LABELS).map(([abbr, label]) => (
+              <option key={abbr} value={abbr}>{abbr} — {label}</option>
+            ))}
+          </select>
         </div>
       </div>
       {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
@@ -1350,13 +1352,15 @@ interface PricingPanelProps {
   takeoffId: string;
   sections: TakeoffSection[];
   initialBid?: BidData;
+  /** Quantity overrides shared with the Materials tab (`${trade}::${description}` → qty). */
+  initialQuantityOverrides?: Record<string, number>;
   subcontractors: Subcontractor[];
   onSubcontractorAdded: (sub: Subcontractor) => void;
   onSaved: (data: TakeoffData) => void;
   readOnly?: boolean;
 }
 
-function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubcontractorAdded, onSaved, readOnly = false }: PricingPanelProps) {
+function PricingPanel({ takeoffId, sections, initialBid, initialQuantityOverrides = {}, subcontractors, onSubcontractorAdded, onSaved, readOnly = false }: PricingPanelProps) {
   const [aiPrices, setAiPrices] = useState<Record<string, PriceParts>>(() => {
     const out: Record<string, PriceParts> = {};
     for (const [k, v] of Object.entries(initialBid?.aiPrices ?? {})) out[k] = priceParts(v);
@@ -1417,6 +1421,17 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
   // User-added line items, kept separate from the AI takeoff so the original is preserved.
   const [customItems, setCustomItems] = useState<CustomLineItem[]>(initialBid?.customItems ?? []);
   const renderSections = useMemo(() => mergeSections(sections, customItems), [sections, customItems]);
+
+  // Quantity overrides — shared with the Materials tab, so a change here shows up there too.
+  const [quantityOverrides, setQuantityOverrides] = useState<Record<string, number>>(initialQuantityOverrides);
+  const effectiveQty = (key: string, fallback: number) => quantityOverrides[key] ?? fallback;
+  const setQuantityOverride = (key: string, val: string) =>
+    setQuantityOverrides((prev) => {
+      const next = { ...prev };
+      if (val === '') delete next[key];
+      else next[key] = parseFloat(val);
+      return next;
+    });
 
   const removeCustomItem = (trade: string, description: string) =>
     setCustomItems((prev) => prev.filter((c) => !(c.trade === trade && c.description === description)));
@@ -1501,13 +1516,15 @@ function PricingPanel({ takeoffId, sections, initialBid, subcontractors, onSubco
         </div>
         <div className="sm:col-span-2">
           <label className="text-[10px] font-medium uppercase tracking-wide text-slate-400">Unit</label>
-          <input
-            type="text"
+          <select
             value={draftUnit}
             onChange={(e) => setDraftUnit(e.target.value)}
-            placeholder="EA"
-            className="mt-0.5 w-full rounded border border-slate-200 px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
-          />
+            className="mt-0.5 w-full rounded border border-slate-200 bg-white px-2 py-1 text-sm text-slate-700 focus:border-indigo-400 focus:outline-none"
+          >
+            {Object.entries(UNIT_LABELS).map(([abbr, label]) => (
+              <option key={abbr} value={abbr}>{abbr} — {label}</option>
+            ))}
+          </select>
         </div>
       </div>
       {draftError && <p className="mt-2 text-xs text-red-600">{draftError}</p>}
