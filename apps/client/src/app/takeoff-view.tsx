@@ -3950,7 +3950,7 @@ export function TakeoffView({
         )}
 
         {activeTab === 'materials' && (
-          !paid ? (
+          !paid && !locked ? (
             <PaymentGate takeoffId={takeoff.id} quote={quote} quoteLoading={quoteLoading} isSubView={isSubView} onPaid={loadQuote} />
           ) : isSubView && !materialsSections ? (
             <div className="flex flex-col items-center py-14 text-center">
@@ -3979,7 +3979,7 @@ export function TakeoffView({
         )}
 
         {activeTab === 'pricing' && (
-          !paid ? (
+          !paid && !locked ? (
             <PaymentGate takeoffId={takeoff.id} quote={quote} quoteLoading={quoteLoading} isSubView={isSubView} onPaid={loadQuote} />
           ) : isSubView ? (
             <SubPricingPanel
@@ -4011,7 +4011,7 @@ export function TakeoffView({
         )}
 
         {activeTab === 'bids' && (
-          !paid ? (
+          !paid && !locked ? (
             <PaymentGate takeoffId={takeoff.id} quote={quote} quoteLoading={quoteLoading} isSubView={isSubView} onPaid={loadQuote} />
           ) : isSubView ? (
             <SubBidsPanel
