@@ -5,6 +5,8 @@ export interface Trade {
   value: string;
   /** Human-readable display name — shown in the UI and stored as the subcontractor trade tag. */
   label: string;
+  /** Carried through from the questionnaire choice, e.g. "General Contractor" selects every trade. */
+  specialAction?: { type: 'select-all'; except?: string[] };
 }
 
 /**
@@ -14,5 +16,5 @@ export interface Trade {
  * a trade once, in `contractor-questionnaire.json`, and every consumer follows.
  */
 export const TRADES: Trade[] = contractorQuestionnaire.questions['contractor-type'].choices.map(
-  ({ value, label }) => ({ value, label }),
+  ({ value, label, specialAction }) => ({ value, label, specialAction }),
 );

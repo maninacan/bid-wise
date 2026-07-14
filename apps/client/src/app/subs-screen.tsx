@@ -25,6 +25,14 @@ export function SubcontractorFormModal({ initial, initialTrade, onSaved, onClose
 
   const toggleTrade = (trade: string) =>
     setSelectedTrades((prev) => {
+      const choice = TRADES.find((t) => t.label === trade);
+      if (choice?.specialAction?.type === 'select-all') {
+        if (prev.has(trade)) return new Set();
+        const excluded = new Set(choice.specialAction.except ?? []);
+        return new Set(
+          TRADES.filter((t) => !excluded.has(t.value)).map((t) => t.label),
+        );
+      }
       const next = new Set(prev);
       next.has(trade) ? next.delete(trade) : next.add(trade);
       return next;
