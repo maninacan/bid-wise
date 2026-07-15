@@ -1,4 +1,5 @@
 app = 'bidwise-api'
+org = 'bidwise'
 primary_region = 'dfw'
 
 [build]

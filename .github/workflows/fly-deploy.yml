@@ -2,7 +2,7 @@ name: Deploy to Fly.io
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch:
     inputs:
       deploy_all:
@@ -73,12 +73,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.api == 'true'
     runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/develop' && 'dev' || 'production' }}
     concurrency:
-      group: deploy-bidwise-api
+      group: deploy-bidwise-api-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only --config fly-api.toml --dockerfile Dockerfile
+      - run: |
+          CONFIG=fly-api.toml
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then CONFIG=fly-api-dev.toml; fi
+          flyctl deploy --remote-only --config "$CONFIG" --dockerfile Dockerfile
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -86,13 +90,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.client == 'true'
     runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/develop' && 'dev' || 'production' }}
     concurrency:
-      group: deploy-bidwise-client
+      group: deploy-bidwise-client-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: |
-          flyctl deploy --remote-only --config fly-client.toml --dockerfile client.Dockerfile \
+          CONFIG=fly-client.toml
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then CONFIG=fly-client-dev.toml; fi
+          flyctl deploy --remote-only --config "$CONFIG" --dockerfile client.Dockerfile \
             --build-arg VITE_GRAPHQL_URL="${{ secrets.VITE_GRAPHQL_URL }}" \
             --build-arg VITE_API_URL="${{ secrets.VITE_API_URL }}" \
             --build-arg VITE_SUPABASE_URL="${{ secrets.VITE_SUPABASE_URL }}" \
@@ -104,13 +111,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.super-admin-portal == 'true'
     runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/develop' && 'dev' || 'production' }}
     concurrency:
-      group: deploy-bidwise-super-admin-portal
+      group: deploy-bidwise-super-admin-portal-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - run: |
-          flyctl deploy --remote-only --config fly-super-admin-portal.toml --dockerfile super-admin-portal.Dockerfile \
+          CONFIG=fly-super-admin-portal.toml
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then CONFIG=fly-super-admin-portal-dev.toml; fi
+          flyctl deploy --remote-only --config "$CONFIG" --dockerfile super-admin-portal.Dockerfile \
             --build-arg VITE_GRAPHQL_URL="${{ secrets.VITE_GRAPHQL_URL }}" \
             --build-arg VITE_API_URL="${{ secrets.VITE_API_URL }}" \
             --build-arg VITE_SUPABASE_URL="${{ secrets.VITE_SUPABASE_URL }}" \
@@ -122,11 +132,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.marketing == 'true'
     runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/develop' && 'dev' || 'production' }}
     concurrency:
-      group: deploy-bidwise-marketing
+      group: deploy-bidwise-marketing-${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - run: flyctl deploy --remote-only --config fly-marketing.toml --dockerfile marketing.Dockerfile
+      - run: |
+          CONFIG=fly-marketing.toml
+          if [ "${{ github.ref }}" = "refs/heads/develop" ]; then CONFIG=fly-marketing-dev.toml; fi
+          flyctl deploy --remote-only --config "$CONFIG" --dockerfile marketing.Dockerfile \
+            --build-arg PUBLIC_APP_URL="${{ secrets.PUBLIC_APP_URL }}"
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

@@ -1,4 +1,5 @@
 app = 'bidwise'
+org = 'bidwise'
 primary_region = 'dfw'
 
 [build]

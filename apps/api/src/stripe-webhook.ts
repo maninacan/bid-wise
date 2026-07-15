@@ -5,7 +5,7 @@
 import type { Request, Response } from 'express';
 import { getStripe } from './lib/stripe';
 import { supabaseAdmin } from './lib/supabase-admin';
-import { creditTopup } from './billing';
+import { creditTopup, persistCardFromSetupIntent } from './billing';
 
 /** The Checkout session fields this handler reads. */
 interface TopupSession {
@@ -49,6 +49,12 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
           sessionId: session.id,
           amountCents: session.amount_total ?? 0,
         });
+      } else if (session.metadata?.kind === 'card_setup' && userId) {
+        // Backup path in case the browser never returns to confirmCardSetup after redirect.
+        const full = await getStripe().checkout.sessions.retrieve(session.id, { expand: ['setup_intent'] });
+        if (full.setup_intent && typeof full.setup_intent !== 'string') {
+          await persistCardFromSetupIntent(supabaseAdmin, userId, full.setup_intent);
+        }
       }
     }
   } catch (err) {

@@ -6,6 +6,10 @@ WORKDIR /app
 ENV CI=true
 ENV NX_DAEMON=false
 
+# Astro bakes PUBLIC_* vars into the bundle at build time — declared as a build arg so
+# prod/dev deploys can point the marketing site's links at their own app URL.
+ARG PUBLIC_APP_URL
+
 # Copy manifests first so `npm ci` is cached until a package.json changes.
 COPY package.json package-lock.json ./
 COPY apps/api/package.json                    apps/api/package.json
@@ -20,6 +24,9 @@ COPY libs/data/package.json                   libs/data/package.json
 RUN npm ci --no-audit --no-fund
 
 COPY . .
+
+# Set PUBLIC_ env after install so value changes don't bust the npm ci layer.
+ENV PUBLIC_APP_URL=$PUBLIC_APP_URL
 
 # Build Astro directly (not `nx build marketing`) to avoid the
 # @geekvetica/nx-astro executor's stdout/stderr maxBuffer overflow.

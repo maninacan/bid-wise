@@ -10,7 +10,18 @@ import {
   displaySquareFeet,
   INVALID_SQUARE_FEET_MESSAGE,
 } from '../lib/pricing';
-import { getBalanceCents, isTakeoffPaid, creditTopup } from '../billing';
+import {
+  getBalanceCents,
+  isTakeoffPaid,
+  creditTopup,
+  getBillingCustomer,
+  ensureStripeCustomerId,
+  persistCardFromSetupIntent,
+  setAutoTopup,
+  removeSavedCard as removeSavedCardRow,
+  runAutoTopupIfNeeded,
+  type BillingCustomer,
+} from '../billing';
 import { requireUser, type GqlContext } from './context';
 
 const bad = (message: string) => new GraphQLError(message, { extensions: { code: 'BAD_REQUEST' } });
@@ -694,7 +705,12 @@ async function payForTakeoff(
     const priceCents = priceCentsForSquareFeet(rawSqFt);
     if (priceCents == null) throw invalidSquareFeet();
 
-    const balance = await getBalanceCents(ctx.supabase, user.id);
+    let balance = await getBalanceCents(ctx.supabase, user.id);
+    if (balance < priceCents) {
+      // Give auto top-up a chance to cover the shortfall before declaring insufficient credits.
+      await runAutoTopupIfNeeded(ctx.supabase, user.id);
+      balance = await getBalanceCents(ctx.supabase, user.id);
+    }
     if (balance < priceCents) {
       throw new GraphQLError('Not enough credits to unlock this bid.', {
         extensions: {
@@ -714,6 +730,9 @@ async function payForTakeoff(
     });
     // Unique violation → a concurrent payment already charged it; treat as success.
     if (chargeErr && (chargeErr as { code?: string }).code !== UNIQUE_VIOLATION) throw chargeErr;
+
+    // This charge may have dropped the balance below the auto top-up threshold — replenish now.
+    await runAutoTopupIfNeeded(ctx.supabase, user.id);
   }
 
   return { balanceCents: await getBalanceCents(ctx.supabase, user.id) };
@@ -763,6 +782,82 @@ async function confirmTopup(
     });
   }
   return { balanceCents: await getBalanceCents(ctx.supabase, user.id) };
+}
+
+function toBillingSettings(customer: BillingCustomer | null) {
+  return {
+    hasSavedCard: !!customer?.stripePaymentMethodId,
+    cardBrand: customer?.cardBrand ?? null,
+    cardLast4: customer?.cardLast4 ?? null,
+    autoTopupEnabled: customer?.autoTopupEnabled ?? false,
+    autoTopupThresholdCents: customer?.autoTopupThresholdCents ?? null,
+    autoTopupTargetCents: customer?.autoTopupTargetCents ?? null,
+    autoTopupDisabledReason: customer?.autoTopupDisabledReason ?? null,
+  };
+}
+
+async function billingSettings(_: unknown, __: unknown, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+}
+
+async function startCardSetup(_: unknown, __: unknown, ctx: GqlContext): Promise<{ url: string }> {
+  const user = await requireUser(ctx);
+  const customerId = await ensureStripeCustomerId(ctx.supabase, user.id, user.email ?? undefined);
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'setup',
+    customer: customerId,
+    metadata: { userId: user.id, kind: 'card_setup' },
+    success_url: `${appUrl()}/billing?setup_session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${appUrl()}/billing?setup_canceled=1`,
+  });
+  if (!session.url) throw new GraphQLError('Stripe did not return a checkout URL.');
+  return { url: session.url };
+}
+
+async function confirmCardSetup(_: unknown, { sessionId }: { sessionId: string }, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const session = await getStripe().checkout.sessions.retrieve(sessionId, { expand: ['setup_intent'] });
+  if (session.metadata?.userId === user.id && session.setup_intent && typeof session.setup_intent !== 'string') {
+    await persistCardFromSetupIntent(ctx.supabase, user.id, session.setup_intent);
+  }
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+}
+
+async function updateAutoTopup(
+  _: unknown,
+  { enabled, thresholdCents, targetCents }: { enabled: boolean; thresholdCents?: number | null; targetCents?: number | null },
+  ctx: GqlContext,
+) {
+  const user = await requireUser(ctx);
+
+  if (enabled) {
+    const customer = await getBillingCustomer(ctx.supabase, user.id);
+    if (!customer?.stripePaymentMethodId) throw bad('Save a card before enabling auto top-up.');
+    if (!Number.isInteger(thresholdCents) || !Number.isInteger(targetCents)) {
+      throw bad('Set a minimum balance and a top-up amount.');
+    }
+    if (thresholdCents! < 0) throw bad('Minimum balance cannot be negative.');
+    if (targetCents! < MIN_TOPUP_CENTS || targetCents! > MAX_TOPUP_CENTS) {
+      throw bad(`Top-up amount must be between $${MIN_TOPUP_CENTS / 100} and $${MAX_TOPUP_CENTS / 100}.`);
+    }
+    if (targetCents! <= thresholdCents!) {
+      throw bad('Top-up amount must be greater than the minimum balance.');
+    }
+  }
+
+  await setAutoTopup(ctx.supabase, user.id, {
+    enabled,
+    thresholdCents: enabled ? thresholdCents! : null,
+    targetCents: enabled ? targetCents! : null,
+  });
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+}
+
+async function removeSavedCard(_: unknown, __: unknown, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  await removeSavedCardRow(ctx.supabase, user.id);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
 }
 
 async function finalizeBid(
@@ -884,6 +979,7 @@ export const resolvers = {
     bidQuote,
     adminDashboardStats,
     stripeTestMode,
+    billingSettings,
   },
   Mutation: {
     clarifyTakeoff,
@@ -894,6 +990,10 @@ export const resolvers = {
     shareBidPdf,
     createCreditCheckout,
     confirmTopup,
+    startCardSetup,
+    confirmCardSetup,
+    updateAutoTopup,
+    removeSavedCard,
     payForTakeoff,
     finalizeBid,
   },

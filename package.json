@@ -12,7 +12,12 @@
     "deploy:client": "fly deploy --config fly-client.toml --dockerfile client.Dockerfile",
     "deploy:marketing": "fly deploy --config fly-marketing.toml --dockerfile marketing.Dockerfile",
     "deploy:sap": "fly deploy --config fly-super-admin-portal.toml --dockerfile super-admin-portal.Dockerfile",
-    "secrets:api": "doppler run --project bid-wise --config prd -- sh -c 'fly secrets set -a bidwise-api SUPABASE_URL=\"$SUPABASE_URL\" SUPABASE_SERVICE_ROLE_KEY=\"$SUPABASE_SERVICE_ROLE_KEY\" ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" RESEND_API_KEY=\"$RESEND_API_KEY\" RESEND_FROM_EMAIL=\"$RESEND_FROM_EMAIL\" STRIPE_SECRET_KEY=\"$STRIPE_SECRET_KEY\" CORS_ALLOWED_ORIGINS=\"$CORS_ALLOWED_ORIGINS\" APP_URL=\"$APP_URL\"'"
+    "secrets:api": "doppler run --project bid-wise --config prd -- sh -c 'fly secrets set -a bidwise-api SUPABASE_URL=\"$SUPABASE_URL\" SUPABASE_SERVICE_ROLE_KEY=\"$SUPABASE_SERVICE_ROLE_KEY\" ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" RESEND_API_KEY=\"$RESEND_API_KEY\" RESEND_FROM_EMAIL=\"$RESEND_FROM_EMAIL\" STRIPE_SECRET_KEY=\"$STRIPE_SECRET_KEY\" CORS_ALLOWED_ORIGINS=\"$CORS_ALLOWED_ORIGINS\" APP_URL=\"$APP_URL\"'",
+    "deploy:api:dev": "fly deploy --config fly-api-dev.toml --dockerfile Dockerfile",
+    "deploy:client:dev": "fly deploy --config fly-client-dev.toml --dockerfile client.Dockerfile",
+    "deploy:marketing:dev": "fly deploy --config fly-marketing-dev.toml --dockerfile marketing.Dockerfile",
+    "deploy:sap:dev": "fly deploy --config fly-super-admin-portal-dev.toml --dockerfile super-admin-portal.Dockerfile",
+    "secrets:api:dev": "doppler run --project bid-wise --config dev -- sh -c 'fly secrets set -a bidwise-api-dev SUPABASE_URL=\"$SUPABASE_URL\" SUPABASE_SERVICE_ROLE_KEY=\"$SUPABASE_SERVICE_ROLE_KEY\" ANTHROPIC_API_KEY=\"$ANTHROPIC_API_KEY\" RESEND_API_KEY=\"$RESEND_API_KEY\" RESEND_FROM_EMAIL=\"$RESEND_FROM_EMAIL\" STRIPE_SECRET_KEY=\"$STRIPE_SECRET_KEY\" STRIPE_WEBHOOK_SECRET=\"$STRIPE_WEBHOOK_SECRET\" CORS_ALLOWED_ORIGINS=\"$CORS_ALLOWED_ORIGINS\" APP_URL=\"$APP_URL\" TELNYX_API_KEY=\"$TELNYX_API_KEY\" TELNYX_FROM_NUMBER=\"$TELNYX_FROM_NUMBER\"'"
   },
   "private": true,
   "devDependencies": {

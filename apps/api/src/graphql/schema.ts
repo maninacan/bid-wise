@@ -18,6 +18,22 @@ export const typeDefs = `#graphql
 
     "True if the server's Stripe key is a test-mode key (sk_test_...)."
     stripeTestMode: Boolean!
+
+    "Saved-card and auto top-up configuration for the signed-in user."
+    billingSettings: BillingSettings!
+  }
+
+  type BillingSettings {
+    hasSavedCard: Boolean!
+    cardBrand: String
+    cardLast4: String
+    autoTopupEnabled: Boolean!
+    "Balance (cents) that triggers an automatic top-up."
+    autoTopupThresholdCents: Int
+    "Balance (cents) an automatic top-up brings the account back up to."
+    autoTopupTargetCents: Int
+    "Set when the last automatic charge failed; cleared once the card or settings are updated."
+    autoTopupDisabledReason: String
   }
 
   type AdminDashboardStats {
@@ -143,6 +159,18 @@ export const typeDefs = `#graphql
 
     "Confirm a returned Checkout session and credit the balance (idempotent)."
     confirmTopup(sessionId: String!): CreditResult!
+
+    "Starts a Stripe Checkout session (setup mode) to save a card for auto top-up."
+    startCardSetup: CheckoutSession!
+
+    "Confirms a returned card-setup session and saves the payment method (idempotent)."
+    confirmCardSetup(sessionId: String!): BillingSettings!
+
+    "Enables/disables auto top-up. When enabling, thresholdCents/targetCents are required and a card must already be saved."
+    updateAutoTopup(enabled: Boolean!, thresholdCents: Int, targetCents: Int): BillingSettings!
+
+    "Removes the saved card and turns off auto top-up."
+    removeSavedCard: BillingSettings!
 
     "Charges the prepaid credit balance for this takeoff's square footage (once per takeoff) and unlocks Materials, Pricing, and Bid."
     payForTakeoff(takeoffId: ID!): PayResult!

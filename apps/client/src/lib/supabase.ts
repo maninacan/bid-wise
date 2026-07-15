@@ -995,6 +995,128 @@ export async function confirmTopup(sessionId: string): Promise<number> {
   }
 }
 
+export interface BillingSettings {
+  hasSavedCard: boolean;
+  cardBrand: string | null;
+  cardLast4: string | null;
+  autoTopupEnabled: boolean;
+  autoTopupThresholdCents: number | null;
+  autoTopupTargetCents: number | null;
+  autoTopupDisabledReason: string | null;
+}
+
+const BILLING_SETTINGS_FIELDS = `
+  hasSavedCard
+  cardBrand
+  cardLast4
+  autoTopupEnabled
+  autoTopupThresholdCents
+  autoTopupTargetCents
+  autoTopupDisabledReason
+`;
+
+const BILLING_SETTINGS = gql`
+  query BillingSettings {
+    billingSettings { ${BILLING_SETTINGS_FIELDS} }
+  }
+`;
+
+/** Saved-card + auto top-up configuration for the current user. */
+export async function getBillingSettings(): Promise<BillingSettings> {
+  const { data } = await apolloClient.query<{ billingSettings: BillingSettings }>({
+    query: BILLING_SETTINGS,
+    context: await authContext(),
+    fetchPolicy: 'network-only',
+  });
+  return data!.billingSettings;
+}
+
+const START_CARD_SETUP = gql`
+  mutation StartCardSetup {
+    startCardSetup {
+      url
+    }
+  }
+`;
+
+/** Creates a Stripe Checkout session (setup mode) to save a card; returns the hosted URL to redirect to. */
+export async function startCardSetup(): Promise<string> {
+  try {
+    const { data } = await apolloClient.mutate<{ startCardSetup: { url: string } }>({
+      mutation: START_CARD_SETUP,
+      context: await authContext(),
+    });
+    return data!.startCardSetup.url;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not start card setup.'));
+  }
+}
+
+const CONFIRM_CARD_SETUP = gql`
+  mutation ConfirmCardSetup($sessionId: String!) {
+    confirmCardSetup(sessionId: $sessionId) { ${BILLING_SETTINGS_FIELDS} }
+  }
+`;
+
+/** Confirms a returned card-setup session and saves the payment method (idempotent). */
+export async function confirmCardSetup(sessionId: string): Promise<BillingSettings> {
+  try {
+    const { data } = await apolloClient.mutate<{ confirmCardSetup: BillingSettings }>({
+      mutation: CONFIRM_CARD_SETUP,
+      variables: { sessionId },
+      context: await authContext(),
+    });
+    return data!.confirmCardSetup;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not save card.'));
+  }
+}
+
+const UPDATE_AUTO_TOPUP = gql`
+  mutation UpdateAutoTopup($enabled: Boolean!, $thresholdCents: Int, $targetCents: Int) {
+    updateAutoTopup(enabled: $enabled, thresholdCents: $thresholdCents, targetCents: $targetCents) {
+      ${BILLING_SETTINGS_FIELDS}
+    }
+  }
+`;
+
+/** Enables/disables auto top-up. When enabling, thresholdCents/targetCents are required and a card must be saved. */
+export async function updateAutoTopup(
+  enabled: boolean,
+  thresholdCents?: number,
+  targetCents?: number,
+): Promise<BillingSettings> {
+  try {
+    const { data } = await apolloClient.mutate<{ updateAutoTopup: BillingSettings }>({
+      mutation: UPDATE_AUTO_TOPUP,
+      variables: { enabled, thresholdCents, targetCents },
+      context: await authContext(),
+    });
+    return data!.updateAutoTopup;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not update auto top-up.'));
+  }
+}
+
+const REMOVE_SAVED_CARD = gql`
+  mutation RemoveSavedCard {
+    removeSavedCard { ${BILLING_SETTINGS_FIELDS} }
+  }
+`;
+
+/** Removes the saved card and turns off auto top-up. */
+export async function removeSavedCard(): Promise<BillingSettings> {
+  try {
+    const { data } = await apolloClient.mutate<{ removeSavedCard: BillingSettings }>({
+      mutation: REMOVE_SAVED_CARD,
+      context: await authContext(),
+    });
+    return data!.removeSavedCard;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not remove card.'));
+  }
+}
+
 /** Fetches all saved plans and generates a takeoff for each, scoped to the given trades. */
 export async function performTakeoffs(trades: string[]): Promise<Takeoff[]> {
   const plans = await listHousePlans();

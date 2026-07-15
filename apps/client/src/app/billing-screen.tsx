@@ -1,11 +1,28 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { confirmTopup, createCreditCheckout, getCreditBalanceCents, getStripeTestMode } from '../lib/supabase';
+import {
+  confirmCardSetup,
+  confirmTopup,
+  createCreditCheckout,
+  getBillingSettings,
+  getCreditBalanceCents,
+  getStripeTestMode,
+  removeSavedCard,
+  startCardSetup,
+  updateAutoTopup,
+  type BillingSettings,
+} from '../lib/supabase';
 
-const TOPUP_PRESETS_CENTS = [2500, 5000, 10000, 20000];
+const TOPUP_PRESETS_CENTS = [2500, 5000, 10000, 20000, 50000, 100000];
+
+// Must match MIN_TOPUP_CENTS / MAX_TOPUP_CENTS in apps/api/src/graphql/resolvers.ts.
+const MIN_TOPUP_CENTS = 500;
+const MAX_TOPUP_CENTS = 100_000;
 
 const fmtUsd = (cents: number) =>
   `$${(cents / 100).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+const centsToDollarInput = (cents: number | null) => (cents == null ? '' : String(cents / 100));
 
 /** Fires after the balance changes so the header chip (and any listener) refetches. */
 export function notifyCreditsChanged() {
@@ -53,6 +70,23 @@ export function BillingScreen() {
   const [starting, setStarting] = useState<number | null>(null);
   const [notice, setNotice] = useState<{ kind: 'success' | 'canceled' | 'error'; text: string } | null>(null);
   const [testMode, setTestMode] = useState(false);
+  const [customAmount, setCustomAmount] = useState('');
+  const [customAmountError, setCustomAmountError] = useState<string | null>(null);
+
+  const [billing, setBilling] = useState<BillingSettings | null>(null);
+  const [cardBusy, setCardBusy] = useState(false);
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [thresholdInput, setThresholdInput] = useState('');
+  const [targetInput, setTargetInput] = useState('');
+  const [autoTopupError, setAutoTopupError] = useState<string | null>(null);
+  const [savingAutoTopup, setSavingAutoTopup] = useState(false);
+
+  const applyBillingSettings = (settings: BillingSettings) => {
+    setBilling(settings);
+    setAutoEnabled(settings.autoTopupEnabled);
+    setThresholdInput(centsToDollarInput(settings.autoTopupThresholdCents));
+    setTargetInput(centsToDollarInput(settings.autoTopupTargetCents));
+  };
 
   // On return from Stripe Checkout: confirm the session (credits the balance) or note a cancel.
   useEffect(() => {
@@ -74,12 +108,35 @@ export function BillingScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // On return from Stripe Checkout (setup mode): confirm the session and save the card.
+  useEffect(() => {
+    const setupSessionId = searchParams.get('setup_session_id');
+    const setupCanceled = searchParams.get('setup_canceled');
+    if (setupSessionId) {
+      confirmCardSetup(setupSessionId)
+        .then((settings) => {
+          applyBillingSettings(settings);
+          setNotice({ kind: 'success', text: 'Card saved.' });
+        })
+        .catch((err) => setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not save card.' }))
+        .finally(() => navigate('/billing', { replace: true }));
+    } else if (setupCanceled) {
+      setNotice({ kind: 'canceled', text: 'Card setup canceled.' });
+      navigate('/billing', { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useEffect(() => {
     getCreditBalanceCents().then(setBalanceCents).catch(() => setBalanceCents(0));
   }, []);
 
   useEffect(() => {
     getStripeTestMode().then(setTestMode).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    getBillingSettings().then(applyBillingSettings).catch(() => {});
   }, []);
 
   const handleTopUp = async (amountCents: number) => {
@@ -90,6 +147,72 @@ export function BillingScreen() {
     } catch (err) {
       setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not start checkout.' });
       setStarting(null);
+    }
+  };
+
+  const handleCustomTopUp = () => {
+    setCustomAmountError(null);
+    const dollars = parseFloat(customAmount);
+    if (!Number.isFinite(dollars)) {
+      setCustomAmountError('Enter an amount.');
+      return;
+    }
+    const cents = Math.round(dollars * 100);
+    if (cents < MIN_TOPUP_CENTS || cents > MAX_TOPUP_CENTS) {
+      setCustomAmountError(`Enter an amount between $${MIN_TOPUP_CENTS / 100} and $${MAX_TOPUP_CENTS / 100}.`);
+      return;
+    }
+    handleTopUp(cents);
+  };
+
+  const handleAddCard = async () => {
+    setCardBusy(true);
+    try {
+      const url = await startCardSetup();
+      window.location.href = url;
+    } catch (err) {
+      setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not start card setup.' });
+      setCardBusy(false);
+    }
+  };
+
+  const handleRemoveCard = async () => {
+    setCardBusy(true);
+    try {
+      applyBillingSettings(await removeSavedCard());
+    } catch (err) {
+      setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not remove card.' });
+    } finally {
+      setCardBusy(false);
+    }
+  };
+
+  const handleSaveAutoTopup = async () => {
+    setAutoTopupError(null);
+    let thresholdCents: number | undefined;
+    let targetCents: number | undefined;
+    if (autoEnabled) {
+      const thresholdDollars = parseFloat(thresholdInput);
+      const targetDollars = parseFloat(targetInput);
+      if (!Number.isFinite(thresholdDollars) || !Number.isFinite(targetDollars)) {
+        setAutoTopupError('Enter valid dollar amounts.');
+        return;
+      }
+      thresholdCents = Math.round(thresholdDollars * 100);
+      targetCents = Math.round(targetDollars * 100);
+      if (targetCents <= thresholdCents) {
+        setAutoTopupError('Top-up amount must be greater than the minimum balance.');
+        return;
+      }
+    }
+    setSavingAutoTopup(true);
+    try {
+      applyBillingSettings(await updateAutoTopup(autoEnabled, thresholdCents, targetCents));
+      setNotice({ kind: 'success', text: autoEnabled ? 'Auto top-up enabled.' : 'Auto top-up disabled.' });
+    } catch (err) {
+      setAutoTopupError(err instanceof Error ? err.message : 'Could not update auto top-up.');
+    } finally {
+      setSavingAutoTopup(false);
     }
   };
 
@@ -136,9 +259,132 @@ export function BillingScreen() {
             </button>
           ))}
         </div>
+
+        <div className="mt-3 flex items-center gap-2">
+          <div className="flex items-center rounded-xl border-2 border-slate-200 px-3 py-2 text-sm focus-within:border-blue-400">
+            <span className="text-slate-400">$</span>
+            <input
+              type="number"
+              min={MIN_TOPUP_CENTS / 100}
+              max={MAX_TOPUP_CENTS / 100}
+              step="1"
+              value={customAmount}
+              onChange={(e) => setCustomAmount(e.target.value)}
+              placeholder="Custom amount"
+              className="ml-1 w-28 text-slate-800 outline-none"
+            />
+          </div>
+          <button
+            type="button"
+            onClick={handleCustomTopUp}
+            disabled={starting !== null || !customAmount}
+            className="rounded-xl border-2 border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50"
+          >
+            Add
+          </button>
+        </div>
+        {customAmountError && <p className="mt-1 text-xs text-red-600">{customAmountError}</p>}
+
         <p className="mt-3 text-xs text-slate-400">
           Secure payment via Stripe.{testMode && ' Test mode.'}
         </p>
+      </div>
+
+      <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+        <p className="text-sm font-medium text-slate-700">Auto top-up</p>
+        <p className="mt-1 text-xs text-slate-500">
+          Automatically recharge your balance from a saved card so you never run out of credits mid-project.
+        </p>
+
+        {billing?.autoTopupDisabledReason && (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            Auto top-up was turned off: {billing.autoTopupDisabledReason}
+          </div>
+        )}
+
+        {!billing?.hasSavedCard ? (
+          <button
+            type="button"
+            onClick={handleAddCard}
+            disabled={cardBusy}
+            className="mt-4 rounded-lg bg-slate-800 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-slate-700 disabled:cursor-wait disabled:opacity-50"
+          >
+            {cardBusy ? 'Redirecting…' : 'Save a card'}
+          </button>
+        ) : (
+          <>
+            <div className="mt-4 flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2 text-sm">
+              <span className="text-slate-700">
+                {billing.cardBrand ? `${billing.cardBrand.toUpperCase()} •••• ${billing.cardLast4}` : 'Card on file'}
+              </span>
+              <button
+                type="button"
+                onClick={handleRemoveCard}
+                disabled={cardBusy}
+                className="text-xs font-medium text-red-500 hover:text-red-600 disabled:opacity-40"
+              >
+                Remove
+              </button>
+            </div>
+
+            <label className="mt-4 flex items-center gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={autoEnabled}
+                onChange={(e) => setAutoEnabled(e.target.checked)}
+                className="accent-blue-600"
+              />
+              Enable auto top-up
+            </label>
+
+            {autoEnabled && (
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-600">When balance drops below</label>
+                  <div className="mt-1 flex items-center rounded-lg border border-slate-200 px-3 py-2 text-sm focus-within:border-blue-400">
+                    <span className="text-slate-400">$</span>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={thresholdInput}
+                      onChange={(e) => setThresholdInput(e.target.value)}
+                      placeholder="25"
+                      className="ml-1 w-full text-slate-800 outline-none"
+                    />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-600">Top up to</label>
+                  <div className="mt-1 flex items-center rounded-lg border border-slate-200 px-3 py-2 text-sm focus-within:border-blue-400">
+                    <span className="text-slate-400">$</span>
+                    <input
+                      type="number"
+                      min={MIN_TOPUP_CENTS / 100}
+                      max={MAX_TOPUP_CENTS / 100}
+                      step="1"
+                      value={targetInput}
+                      onChange={(e) => setTargetInput(e.target.value)}
+                      placeholder="100"
+                      className="ml-1 w-full text-slate-800 outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {autoTopupError && <p className="mt-2 text-xs text-red-600">{autoTopupError}</p>}
+
+            <button
+              type="button"
+              onClick={handleSaveAutoTopup}
+              disabled={savingAutoTopup}
+              className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:cursor-wait disabled:bg-slate-300"
+            >
+              {savingAutoTopup ? 'Saving…' : 'Save auto top-up settings'}
+            </button>
+          </>
+        )}
       </div>
     </section>
   );
