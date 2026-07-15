@@ -9,6 +9,7 @@ import {
   priceCentsForSquareFeet,
   displaySquareFeet,
   INVALID_SQUARE_FEET_MESSAGE,
+  MONTHLY_PLAN_PRICE_CENTS,
 } from '../lib/pricing';
 import {
   getBalanceCents,
@@ -20,9 +21,11 @@ import {
   setAutoTopup,
   removeSavedCard as removeSavedCardRow,
   runAutoTopupIfNeeded,
+  hasActiveMonthlySubscription,
+  syncSubscriptionFromStripe,
   type BillingCustomer,
 } from '../billing';
-import { requireUser, type GqlContext } from './context';
+import { requireUser, requireCompanyMember, requireCompanyOwner, type GqlContext } from './context';
 
 const bad = (message: string) => new GraphQLError(message, { extensions: { code: 'BAD_REQUEST' } });
 
@@ -97,7 +100,6 @@ async function clarifyTakeoff(
   args: { takeoffId: string; clarifications: { gap: string; clarification: string; file?: ClarificationFile | null }[] },
   ctx: GqlContext,
 ) {
-  const user = await requireUser(ctx);
   const { takeoffId, clarifications } = args;
   if (!takeoffId || !Array.isArray(clarifications) || clarifications.length === 0) {
     throw bad('takeoffId and a non-empty clarifications array are required.');
@@ -105,11 +107,11 @@ async function clarifyTakeoff(
 
   const { data: takeoff, error: takeoffError } = await ctx.supabase
     .from('takeoffs')
-    .select('id, plan_id, data')
+    .select('id, plan_id, company_id, data')
     .eq('id', takeoffId)
-    .eq('user_id', user.id)
     .single();
   if (takeoffError || !takeoff) throw new GraphQLError('Takeoff not found.', { extensions: { code: 'NOT_FOUND' } });
+  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
 
   // Interleave each gap's clarification (and any attached file) so the model can tie an
   // uploaded spec sheet / photo / PDF to the specific gap it resolves.
@@ -184,6 +186,7 @@ Respond with ONLY this JSON — no markdown, no prose:
 
   await trackUsage(ctx.supabase, {
     user_id: user.id,
+    company_id: takeoff.company_id,
     plan_id: takeoff.plan_id,
     takeoff_id: takeoff.id,
     operation: 'clarify-takeoff',
@@ -203,17 +206,16 @@ async function recalculateMaterials(
   args: { takeoffId: string },
   ctx: GqlContext,
 ) {
-  const user = await requireUser(ctx);
   const { takeoffId } = args;
   if (!takeoffId) throw bad('takeoffId is required.');
 
   const { data: takeoff, error: takeoffError } = await ctx.supabase
     .from('takeoffs')
-    .select('id, plan_id, data')
+    .select('id, plan_id, company_id, data')
     .eq('id', takeoffId)
-    .eq('user_id', user.id)
     .single();
   if (takeoffError || !takeoff) throw new GraphQLError('Takeoff not found.', { extensions: { code: 'NOT_FOUND' } });
+  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
 
   type LineItem = { description: string; quantity: number; unit: string; source: string; notes?: string };
   const sections = (takeoff.data.sections ?? []) as { trade: string; items: LineItem[] }[];
@@ -272,6 +274,7 @@ Respond with ONLY this JSON — no markdown, no prose:
 
   await trackUsage(ctx.supabase, {
     user_id: user.id,
+    company_id: takeoff.company_id,
     plan_id: takeoff.plan_id,
     takeoff_id: takeoff.id,
     operation: 'recalculate-materials',
@@ -296,12 +299,21 @@ async function getLocalPricing(
   if (!zipCode?.trim()) throw bad('zipCode is required.');
   if (!lineItems?.length) throw bad('lineItems is required.');
 
-  // Resolve plan_id from takeoff if provided (service role — works for subs too).
+  // Resolve plan_id from takeoff if provided. Also closes a prior gap where this resolver
+  // never verified the caller could access the takeoff at all — only that it was paid.
   let plan_id: string | null = null;
+  let company_id: string | null = null;
   if (takeoffId) {
+    const { data: takeoff } = await ctx.supabase
+      .from('takeoffs')
+      .select('plan_id, company_id')
+      .eq('id', takeoffId)
+      .maybeSingle();
+    if (!takeoff) throw new GraphQLError('Takeoff not found.', { extensions: { code: 'NOT_FOUND' } });
+    await requireCompanyMember(ctx, takeoff.company_id);
     await requirePaid(ctx, takeoffId);
-    const { data: takeoff } = await ctx.supabase.from('takeoffs').select('plan_id').eq('id', takeoffId).single();
-    if (takeoff) plan_id = takeoff.plan_id;
+    plan_id = takeoff.plan_id;
+    company_id = takeoff.company_id;
   }
 
   const message = await getAnthropic().messages.create({
@@ -374,6 +386,7 @@ Use the submit_pricing tool to return your estimates. Return both numbers for ev
 
   await trackUsage(ctx.supabase, {
     user_id: user.id,
+    company_id,
     plan_id,
     takeoff_id: takeoffId ?? null,
     operation: 'get-local-pricing',
@@ -512,25 +525,47 @@ async function approveSubBid(
   return { ok: true, approvedAt };
 }
 
+/** Sends an email via Resend. Returns an error message string on failure, or null on success. */
+async function sendEmail(
+  to: string,
+  subject: string,
+  html: string,
+  attachments?: { filename: string; content: string }[],
+): Promise<string | null> {
+  const resendKey = process.env.RESEND_API_KEY;
+  if (!resendKey) return 'Email sending is not configured (missing RESEND_API_KEY).';
+  const fromEmail = process.env.RESEND_FROM_EMAIL ?? 'BidWise <onboarding@resend.dev>';
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from: fromEmail, to: [to], subject, html, ...(attachments ? { attachments } : {}) }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    console.error('[sendEmail] Resend error:', res.status, body);
+    return `Email send failed: ${res.status}`;
+  }
+  return null;
+}
+
 // ── shareBidPdf ─────────────────────────────────────────────────────────────
 async function shareBidPdf(
   _: unknown,
   args: { takeoffId: string; email?: string; phone?: string; sharingMode?: 'full' | 'summary' },
   ctx: GqlContext,
 ) {
-  const user = await requireUser(ctx);
   const { takeoffId, email, phone, sharingMode } = args;
   if (!takeoffId) throw bad('takeoffId is required.');
   if (!email && !phone) throw bad('At least one of email or phone is required.');
-  await requirePaid(ctx, takeoffId);
 
   const { data: row, error: fetchError } = await ctx.supabase
     .from('takeoffs')
-    .select('data')
+    .select('company_id, data')
     .eq('id', takeoffId)
-    .eq('user_id', user.id)
     .single();
   if (fetchError || !row) throw new GraphQLError('Takeoff not found or access denied.', { extensions: { code: 'NOT_FOUND' } });
+  await requireCompanyMember(ctx, row.company_id);
+  await requirePaid(ctx, takeoffId);
 
   const data = row.data as BidTakeoffData;
   if (!data.bid?.finalizedAt) throw bad('Bid must be finalized before sharing.');
@@ -548,20 +583,11 @@ async function shareBidPdf(
 
   // ── Email via Resend ──
   if (email) {
-    const resendKey = process.env.RESEND_API_KEY;
-    if (!resendKey) {
-      errors.push('Email sending is not configured (missing RESEND_API_KEY).');
-    } else {
-      const fromEmail = process.env.RESEND_FROM_EMAIL ?? 'BidWise <onboarding@resend.dev>';
-      const pdfBase64 = Buffer.from(pdfBytes).toString('base64');
-      const res = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${resendKey}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          from: fromEmail,
-          to: [email],
-          subject: `Bid Proposal: ${data.projectName}`,
-          html: `<!DOCTYPE html><html><body style="margin:0;padding:32px 0;background:#f8fafc;font-family:sans-serif;">
+    const pdfBase64 = Buffer.from(pdfBytes).toString('base64');
+    const emailError = await sendEmail(
+      email,
+      `Bid Proposal: ${data.projectName}`,
+      `<!DOCTYPE html><html><body style="margin:0;padding:32px 0;background:#f8fafc;font-family:sans-serif;">
 <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:12px;padding:40px 48px;">
   <div style="text-align:center;margin-bottom:32px;">
     <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" style="display:inline-block;vertical-align:middle;margin-right:10px;">
@@ -573,15 +599,9 @@ async function shareBidPdf(
   <p style="color:#374151;font-size:15px;line-height:1.6;margin:0;">Please find the bid proposal for <strong>${data.projectName}</strong> attached.</p>
 </div>
 </body></html>`,
-          attachments: [{ filename: `bid-proposal-${safeName}.pdf`, content: pdfBase64 }],
-        }),
-      });
-      if (!res.ok) {
-        const body = await res.text();
-        console.error('[shareBidPdf] Resend error:', res.status, body);
-        errors.push(`Email send failed: ${res.status}`);
-      }
-    }
+      [{ filename: `bid-proposal-${safeName}.pdf`, content: pdfBase64 }],
+    );
+    if (emailError) errors.push(emailError);
   }
 
   // ── SMS via Telnyx ──
@@ -627,6 +647,237 @@ async function shareBidPdf(
   return { ok: true };
 }
 
+// ── Companies / team ─────────────────────────────────────────────────────────
+
+interface CompanyRow {
+  id: string;
+  name: string;
+  billing_email: string | null;
+  created_at: string;
+}
+
+function toCompany(row: CompanyRow) {
+  return { id: row.id, name: row.name, billingEmail: row.billing_email, createdAt: row.created_at };
+}
+
+interface CompanyInviteRow {
+  id: string;
+  company_id: string;
+  email: string;
+  role: string;
+  status: string;
+  created_at: string;
+  expires_at: string;
+  /** Only ever selected (and thus populated) for myPendingInvites, which is already scoped
+   *  to the caller's own verified email — never selected for companyInvites' owner-facing
+   *  roster, so the token isn't broadcast beyond the invitee and the inviter who created it. */
+  token?: string;
+}
+
+function toCompanyInvite(row: CompanyInviteRow) {
+  return {
+    id: row.id,
+    companyId: row.company_id,
+    email: row.email,
+    role: row.role,
+    status: row.status,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+    token: row.token ?? null,
+  };
+}
+
+async function myCompanies(_: unknown, __: unknown, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const { data, error } = await ctx.supabase
+    .from('company_members')
+    .select('role, companies(id, name, billing_email, created_at)')
+    .eq('user_id', user.id);
+  if (error) throw error;
+
+  return ((data ?? []) as unknown as { role: string; companies: CompanyRow | null }[])
+    .filter((m) => m.companies)
+    .map((m) => ({ role: m.role, company: toCompany(m.companies as CompanyRow) }));
+}
+
+async function companyMembers(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext) {
+  await requireCompanyMember(ctx, companyId);
+  const { data, error } = await ctx.supabase
+    .from('company_members')
+    .select('user_id, role, joined_at')
+    .eq('company_id', companyId)
+    .order('joined_at', { ascending: true });
+  if (error) throw error;
+
+  return Promise.all(
+    (data ?? []).map(async (m) => {
+      const { data: userData } = await ctx.supabase.auth.admin.getUserById(m.user_id as string);
+      return {
+        userId: m.user_id,
+        email: userData?.user?.email ?? 'unknown',
+        role: m.role,
+        joinedAt: m.joined_at,
+      };
+    }),
+  );
+}
+
+async function companyInvites(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext) {
+  await requireCompanyMember(ctx, companyId);
+  const { data, error } = await ctx.supabase
+    .from('company_invites')
+    .select('id, company_id, email, role, status, created_at, expires_at')
+    .eq('company_id', companyId)
+    .order('created_at', { ascending: false });
+  if (error) throw error;
+  return ((data ?? []) as CompanyInviteRow[]).map(toCompanyInvite);
+}
+
+async function myPendingInvites(_: unknown, __: unknown, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  if (!user.email) return [];
+  const { data, error } = await ctx.supabase
+    .from('company_invites')
+    .select('id, company_id, email, role, status, created_at, expires_at, token')
+    .eq('status', 'pending')
+    .eq('email', user.email.trim().toLowerCase())
+    .gt('expires_at', new Date().toISOString());
+  if (error) throw error;
+  return ((data ?? []) as CompanyInviteRow[]).map(toCompanyInvite);
+}
+
+async function createCompany(_: unknown, { name }: { name: string }, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const trimmed = name?.trim();
+  if (!trimmed) throw bad('Company name is required.');
+
+  const { data: companyId, error } = await ctx.supabase.rpc('create_company_with_owner', {
+    p_name: trimmed,
+    p_owner: user.id,
+  });
+  if (error) throw error;
+
+  const { data: company, error: fetchErr } = await ctx.supabase
+    .from('companies')
+    .select('id, name, billing_email, created_at')
+    .eq('id', companyId)
+    .single();
+  if (fetchErr || !company) throw new GraphQLError('Failed to create company.');
+  return toCompany(company);
+}
+
+async function inviteTeamMember(
+  _: unknown,
+  { companyId, email }: { companyId: string; email: string },
+  ctx: GqlContext,
+) {
+  const user = await requireCompanyOwner(ctx, companyId);
+  const trimmedEmail = email?.trim().toLowerCase();
+  if (!trimmedEmail || !trimmedEmail.includes('@')) throw bad('A valid email is required.');
+
+  const { data: company } = await ctx.supabase.from('companies').select('name').eq('id', companyId).single();
+
+  const { data: invite, error } = await ctx.supabase
+    .from('company_invites')
+    .insert({ company_id: companyId, email: trimmedEmail, invited_by: user.id })
+    .select('id, company_id, email, role, status, created_at, expires_at, token')
+    .single();
+  if (error) {
+    if ((error as { code?: string }).code === UNIQUE_VIOLATION) {
+      throw bad('This email already has a pending invite for this company.');
+    }
+    throw error;
+  }
+
+  const acceptUrl = `${appUrl()}/accept-invite?token=${invite.token}`;
+  const emailError = await sendEmail(
+    trimmedEmail,
+    `You've been invited to join ${company?.name ?? 'a company'} on Bid Wise`,
+    `<!DOCTYPE html><html><body style="margin:0;padding:32px 0;background:#f8fafc;font-family:sans-serif;">
+<div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:12px;padding:40px 48px;">
+  <div style="text-align:center;margin-bottom:32px;">
+    <span style="font-size:28px;font-weight:700;color:#0f172a;letter-spacing:-0.5px;">Bid<span style="color:#2563eb;">Wise</span></span>
+  </div>
+  <p style="color:#374151;font-size:15px;line-height:1.6;margin:0 0 24px;">You've been invited to join <strong>${company?.name ?? 'a company'}</strong> on Bid Wise.</p>
+  <p style="text-align:center;margin:0;">
+    <a href="${acceptUrl}" style="display:inline-block;background:#2563eb;color:#ffffff;text-decoration:none;padding:12px 28px;border-radius:8px;font-weight:600;">Accept invite</a>
+  </p>
+</div>
+</body></html>`,
+  );
+  if (emailError) {
+    // Delete rather than leave a dangling pending invite — the unique index on
+    // (company_id, lower(email)) WHERE status='pending' would otherwise block a retry.
+    await ctx.supabase.from('company_invites').delete().eq('id', invite.id);
+    throw new GraphQLError(`Could not send invite email: ${emailError}`);
+  }
+
+  return toCompanyInvite(invite);
+}
+
+async function revokeInvite(_: unknown, { inviteId }: { inviteId: string }, ctx: GqlContext) {
+  const { data: invite } = await ctx.supabase
+    .from('company_invites')
+    .select('id, company_id, status')
+    .eq('id', inviteId)
+    .maybeSingle();
+  if (!invite) throw new GraphQLError('Invite not found.', { extensions: { code: 'NOT_FOUND' } });
+  await requireCompanyOwner(ctx, invite.company_id);
+  if (invite.status !== 'pending') throw bad('Only pending invites can be revoked.');
+
+  const { error } = await ctx.supabase.from('company_invites').update({ status: 'revoked' }).eq('id', inviteId);
+  if (error) throw error;
+  return { ok: true };
+}
+
+async function acceptInvite(_: unknown, { token }: { token: string }, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const { data: invite } = await ctx.supabase
+    .from('company_invites')
+    .select('id, company_id, email, role, status, expires_at')
+    .eq('token', token)
+    .maybeSingle();
+  if (!invite) throw new GraphQLError('Invite not found.', { extensions: { code: 'NOT_FOUND' } });
+  if (invite.status !== 'pending') throw bad('This invite is no longer valid.');
+  if (new Date(invite.expires_at).getTime() < Date.now()) throw bad('This invite has expired.');
+  if (!user.email || user.email.trim().toLowerCase() !== invite.email.toLowerCase()) {
+    throw new GraphQLError('This invite was sent to a different email address.', { extensions: { code: 'FORBIDDEN' } });
+  }
+
+  const { error: memberErr } = await ctx.supabase
+    .from('company_members')
+    .insert({ company_id: invite.company_id, user_id: user.id, role: invite.role });
+  if (memberErr && (memberErr as { code?: string }).code !== UNIQUE_VIOLATION) throw memberErr;
+
+  await ctx.supabase
+    .from('company_invites')
+    .update({ status: 'accepted', accepted_by: user.id, accepted_at: new Date().toISOString() })
+    .eq('id', invite.id);
+
+  const { data: company, error: companyErr } = await ctx.supabase
+    .from('companies')
+    .select('id, name, billing_email, created_at')
+    .eq('id', invite.company_id)
+    .single();
+  if (companyErr || !company) throw new GraphQLError('Failed to load company.');
+  return toCompany(company);
+}
+
+async function removeTeamMember(
+  _: unknown,
+  { companyId, userId }: { companyId: string; userId: string },
+  ctx: GqlContext,
+) {
+  await requireCompanyOwner(ctx, companyId);
+  const { error } = await ctx.supabase
+    .from('company_members')
+    .delete()
+    .eq('company_id', companyId)
+    .eq('user_id', userId);
+  if (error) throw bad(error.message);
+  return { ok: true };
+}
+
 // ── Billing / credits ────────────────────────────────────────────────────────
 
 const MIN_TOPUP_CENTS = 500; // $5
@@ -646,22 +897,15 @@ async function bidQuote(
   { takeoffId }: { takeoffId: string },
   ctx: GqlContext,
 ): Promise<{ squareFeet: number; priceCents: number; alreadyPaid: boolean; balanceCents: number }> {
-  const user = await requireUser(ctx);
   const { data: takeoff } = await ctx.supabase
     .from('takeoffs')
-    .select('id, data')
+    .select('id, company_id, data')
     .eq('id', takeoffId)
-    .eq('user_id', user.id)
     .maybeSingle();
   if (!takeoff) throw bad('Takeoff not found.');
+  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
 
-  const { data: existingCharge } = await ctx.supabase
-    .from('credit_transactions')
-    .select('id')
-    .eq('takeoff_id', takeoffId)
-    .eq('kind', 'charge')
-    .maybeSingle();
-  const alreadyPaid = !!existingCharge;
+  const alreadyPaid = await isTakeoffPaid(ctx.supabase, takeoffId);
 
   const rawSqFt = totalSquareFeetRaw((takeoff.data as { areas?: { squareFeet?: number }[] })?.areas);
   let priceCents = 0;
@@ -684,23 +928,17 @@ async function payForTakeoff(
   { takeoffId }: { takeoffId: string },
   ctx: GqlContext,
 ): Promise<{ balanceCents: number }> {
-  const user = await requireUser(ctx);
   const { data: takeoff } = await ctx.supabase
     .from('takeoffs')
-    .select('id, data')
+    .select('id, company_id, data')
     .eq('id', takeoffId)
-    .eq('user_id', user.id)
     .maybeSingle();
   if (!takeoff) throw bad('Takeoff not found.');
+  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
 
-  const { data: existingCharge } = await ctx.supabase
-    .from('credit_transactions')
-    .select('id')
-    .eq('takeoff_id', takeoffId)
-    .eq('kind', 'charge')
-    .maybeSingle();
+  const alreadyCovered = await isTakeoffPaid(ctx.supabase, takeoffId);
 
-  if (!existingCharge) {
+  if (!alreadyCovered) {
     const rawSqFt = totalSquareFeetRaw((takeoff.data as { areas?: { squareFeet?: number }[] })?.areas);
     const priceCents = priceCentsForSquareFeet(rawSqFt);
     if (priceCents == null) throw invalidSquareFeet();
@@ -793,11 +1031,89 @@ function toBillingSettings(customer: BillingCustomer | null) {
     autoTopupThresholdCents: customer?.autoTopupThresholdCents ?? null,
     autoTopupTargetCents: customer?.autoTopupTargetCents ?? null,
     autoTopupDisabledReason: customer?.autoTopupDisabledReason ?? null,
+    plan: customer?.plan ?? 'per_bid',
+    subscriptionStatus: customer?.subscriptionStatus ?? null,
+    subscriptionCancelAtPeriodEnd: customer?.subscriptionCancelAtPeriodEnd ?? false,
+    subscriptionCurrentPeriodEnd: customer?.subscriptionCurrentPeriodEnd ?? null,
+    monthlyPlanPriceCents: MONTHLY_PLAN_PRICE_CENTS,
   };
 }
 
 async function billingSettings(_: unknown, __: unknown, ctx: GqlContext) {
   const user = await requireUser(ctx);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+}
+
+// ── Monthly plan / subscription ──────────────────────────────────────────────
+
+async function createSubscriptionCheckout(_: unknown, __: unknown, ctx: GqlContext): Promise<{ url: string }> {
+  const user = await requireUser(ctx);
+  if (hasActiveMonthlySubscription(await getBillingCustomer(ctx.supabase, user.id))) {
+    throw bad('You already have an active monthly plan.');
+  }
+  const customerId = await ensureStripeCustomerId(ctx.supabase, user.id, user.email ?? undefined);
+  const session = await getStripe().checkout.sessions.create({
+    mode: 'subscription',
+    customer: customerId,
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: MONTHLY_PLAN_PRICE_CENTS,
+          recurring: { interval: 'month' },
+          product_data: { name: 'Bid Wise — Unlimited Monthly' },
+        },
+      },
+    ],
+    // Metadata on the subscription itself (not just the session) so the webhook can resolve
+    // userId directly from subscription.updated/deleted events without a customer lookup.
+    subscription_data: { metadata: { userId: user.id } },
+    metadata: { userId: user.id, kind: 'subscription' },
+    success_url: `${appUrl()}/billing?sub_session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${appUrl()}/billing?sub_canceled=1`,
+  });
+  if (!session.url) throw new GraphQLError('Stripe did not return a checkout URL.');
+  return { url: session.url };
+}
+
+async function confirmSubscriptionCheckout(
+  _: unknown,
+  { sessionId }: { sessionId: string },
+  ctx: GqlContext,
+) {
+  const user = await requireUser(ctx);
+  const session = await getStripe().checkout.sessions.retrieve(sessionId, { expand: ['subscription'] });
+  if (
+    session.metadata?.kind === 'subscription' &&
+    session.metadata?.userId === user.id &&
+    session.subscription &&
+    typeof session.subscription !== 'string'
+  ) {
+    await syncSubscriptionFromStripe(ctx.supabase, user.id, session.subscription);
+  }
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+}
+
+async function cancelSubscription(_: unknown, __: unknown, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const customer = await getBillingCustomer(ctx.supabase, user.id);
+  if (!customer?.stripeSubscriptionId) throw bad('No active subscription to cancel.');
+  const subscription = await getStripe().subscriptions.update(customer.stripeSubscriptionId, {
+    cancel_at_period_end: true,
+  });
+  await syncSubscriptionFromStripe(ctx.supabase, user.id, subscription);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+}
+
+async function resumeSubscription(_: unknown, __: unknown, ctx: GqlContext) {
+  const user = await requireUser(ctx);
+  const customer = await getBillingCustomer(ctx.supabase, user.id);
+  if (!customer?.stripeSubscriptionId) throw bad('No subscription to resume.');
+  const subscription = await getStripe().subscriptions.update(customer.stripeSubscriptionId, {
+    cancel_at_period_end: false,
+  });
+  await syncSubscriptionFromStripe(ctx.supabase, user.id, subscription);
   return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
 }
 
@@ -869,15 +1185,13 @@ async function finalizeBid(
   { takeoffId }: { takeoffId: string },
   ctx: GqlContext,
 ): Promise<{ data: unknown; balanceCents: number }> {
-  const user = await requireUser(ctx);
-
   const { data: takeoff } = await ctx.supabase
     .from('takeoffs')
-    .select('data')
+    .select('company_id, data')
     .eq('id', takeoffId)
-    .eq('user_id', user.id)
     .maybeSingle();
   if (!takeoff) throw bad('Takeoff not found.');
+  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
 
   const data = takeoff.data as { bid?: { finalizedAt?: string } };
   if (!data.bid) throw bad('Add pricing before finalizing.');
@@ -984,6 +1298,10 @@ export const resolvers = {
     adminDashboardStats,
     stripeTestMode,
     billingSettings,
+    myCompanies,
+    companyMembers,
+    companyInvites,
+    myPendingInvites,
   },
   Mutation: {
     clarifyTakeoff,
@@ -1000,5 +1318,14 @@ export const resolvers = {
     removeSavedCard,
     payForTakeoff,
     finalizeBid,
+    createSubscriptionCheckout,
+    confirmSubscriptionCheckout,
+    cancelSubscription,
+    resumeSubscription,
+    createCompany,
+    inviteTeamMember,
+    revokeInvite,
+    acceptInvite,
+    removeTeamMember,
   },
 };

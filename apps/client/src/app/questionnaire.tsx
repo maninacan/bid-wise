@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { contractorQuestionnaire } from '@bid-wise/data';
 import { generateTakeoff, performTakeoffs, cancelTakeoff, cancelAllActiveTakeoffs, getActiveTakeoffJob, getActiveTakeoffJobs, getFinalizedTakeoffForPlan, planDisplayName, unfinalizeBid, subscribeTakeoffJob, subscribeUserTakeoffJobs, TakeoffCanceledError, type HousePlan, type PricingMatrix, type Takeoff, type TakeoffPhase, type TakeoffJob } from '../lib/supabase';
+import { useCompany } from '../lib/company-context';
 import { TakeoffView } from './takeoff-view';
 
 const { questions, results, start } = contractorQuestionnaire;
@@ -49,6 +50,7 @@ const fmtElapsed = (ms: number) => {
 
 export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, planName, trades: allowedTrades }: { pricingMatrix?: PricingMatrix; planId?: string; planName?: string; trades?: string[] }) {
   const navigate = useNavigate();
+  const { activeCompanyId } = useCompany();
   const [currentQuestionId, setCurrentQuestionId] = useState<string | null>(start);
   const [pendingBranches, setPendingBranches] = useState<string[]>([]);
   const [resultIds, setResultIds] = useState<string[]>([]);
@@ -178,7 +180,7 @@ export function Questionnaire({ pricingMatrix = EMPTY_MATRIX, planId, planName, 
           onPhase: advancePhase,
           onProgress: (captured) => setCompileTrades(captured),
         }).then((t) => [t])
-      : performTakeoffs,
+      : (trades) => performTakeoffs(activeCompanyId!, trades),
   };
 
   const question = currentQuestionId ? questions[currentQuestionId] : null;

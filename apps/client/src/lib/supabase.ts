@@ -42,6 +42,208 @@ export async function signOut(): Promise<void> {
   if (error) throw error;
 }
 
+// ── Companies / team ──────────────────────────────────────────────────────────
+
+export interface Company {
+  id: string;
+  name: string;
+  billingEmail: string | null;
+  createdAt: string;
+}
+
+export interface CompanyMembership {
+  company: Company;
+  role: 'owner' | 'member';
+}
+
+export interface CompanyMember {
+  userId: string;
+  email: string;
+  role: 'owner' | 'member';
+  joinedAt: string;
+}
+
+export interface CompanyInvite {
+  id: string;
+  companyId: string;
+  email: string;
+  role: 'owner' | 'member';
+  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  createdAt: string;
+  expiresAt: string;
+  /** Accept token — only ever populated on myPendingInvites(), null elsewhere. */
+  token: string | null;
+}
+
+const MY_COMPANIES = gql`
+  query MyCompanies {
+    myCompanies {
+      role
+      company { id name billingEmail createdAt }
+    }
+  }
+`;
+
+/** Companies the signed-in user belongs to, with their role in each. */
+export async function myCompanies(): Promise<CompanyMembership[]> {
+  const { data } = await apolloClient.query<{ myCompanies: CompanyMembership[] }>({
+    query: MY_COMPANIES,
+    context: await authContext(),
+    fetchPolicy: 'network-only',
+  });
+  return data!.myCompanies;
+}
+
+const COMPANY_MEMBERS = gql`
+  query CompanyMembers($companyId: ID!) {
+    companyMembers(companyId: $companyId) { userId email role joinedAt }
+  }
+`;
+
+/** Members of a company's roster. Caller must be a member of it. */
+export async function companyMembers(companyId: string): Promise<CompanyMember[]> {
+  const { data } = await apolloClient.query<{ companyMembers: CompanyMember[] }>({
+    query: COMPANY_MEMBERS,
+    variables: { companyId },
+    context: await authContext(),
+    fetchPolicy: 'network-only',
+  });
+  return data!.companyMembers;
+}
+
+const COMPANY_INVITES = gql`
+  query CompanyInvites($companyId: ID!) {
+    companyInvites(companyId: $companyId) { id companyId email role status createdAt expiresAt }
+  }
+`;
+
+/** Invites (any status) for a company, newest first. Caller must be a member of it. */
+export async function companyInvites(companyId: string): Promise<CompanyInvite[]> {
+  const { data } = await apolloClient.query<{ companyInvites: CompanyInvite[] }>({
+    query: COMPANY_INVITES,
+    variables: { companyId },
+    context: await authContext(),
+    fetchPolicy: 'network-only',
+  });
+  return data!.companyInvites;
+}
+
+const MY_PENDING_INVITES = gql`
+  query MyPendingInvites {
+    myPendingInvites { id companyId email role status createdAt expiresAt token }
+  }
+`;
+
+/** Pending, unexpired invites addressed to the signed-in user's own email. */
+export async function myPendingInvites(): Promise<CompanyInvite[]> {
+  const { data } = await apolloClient.query<{ myPendingInvites: CompanyInvite[] }>({
+    query: MY_PENDING_INVITES,
+    context: await authContext(),
+    fetchPolicy: 'network-only',
+  });
+  return data!.myPendingInvites;
+}
+
+const CREATE_COMPANY = gql`
+  mutation CreateCompany($name: String!) {
+    createCompany(name: $name) { id name billingEmail createdAt }
+  }
+`;
+
+/** Creates a new company with the caller as its owner. */
+export async function createCompany(name: string): Promise<Company> {
+  try {
+    const { data } = await apolloClient.mutate<{ createCompany: Company }>({
+      mutation: CREATE_COMPANY,
+      variables: { name },
+      context: await authContext(),
+    });
+    return data!.createCompany;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not create company.'));
+  }
+}
+
+const INVITE_TEAM_MEMBER = gql`
+  mutation InviteTeamMember($companyId: ID!, $email: String!) {
+    inviteTeamMember(companyId: $companyId, email: $email) {
+      id companyId email role status createdAt expiresAt
+    }
+  }
+`;
+
+/** Invites a teammate by email. Owner-only. */
+export async function inviteTeamMember(companyId: string, email: string): Promise<CompanyInvite> {
+  try {
+    const { data } = await apolloClient.mutate<{ inviteTeamMember: CompanyInvite }>({
+      mutation: INVITE_TEAM_MEMBER,
+      variables: { companyId, email },
+      context: await authContext(),
+    });
+    return data!.inviteTeamMember;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not send invite.'));
+  }
+}
+
+const REVOKE_INVITE = gql`
+  mutation RevokeInvite($inviteId: ID!) {
+    revokeInvite(inviteId: $inviteId) { ok }
+  }
+`;
+
+/** Revokes a pending invite. Owner-only. */
+export async function revokeInvite(inviteId: string): Promise<void> {
+  try {
+    await apolloClient.mutate({
+      mutation: REVOKE_INVITE,
+      variables: { inviteId },
+      context: await authContext(),
+    });
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not revoke invite.'));
+  }
+}
+
+const ACCEPT_INVITE = gql`
+  mutation AcceptInvite($token: ID!) {
+    acceptInvite(token: $token) { id name billingEmail createdAt }
+  }
+`;
+
+/** Accepts a pending invite addressed to the signed-in user's own email, joining that company. */
+export async function acceptInvite(token: string): Promise<Company> {
+  try {
+    const { data } = await apolloClient.mutate<{ acceptInvite: Company }>({
+      mutation: ACCEPT_INVITE,
+      variables: { token },
+      context: await authContext(),
+    });
+    return data!.acceptInvite;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not accept invite.'));
+  }
+}
+
+const REMOVE_TEAM_MEMBER = gql`
+  mutation RemoveTeamMember($companyId: ID!, $userId: ID!) {
+    removeTeamMember(companyId: $companyId, userId: $userId) { ok }
+  }
+`;
+
+/** Removes a team member from a company. Owner-only; blocked if it would remove the last owner. */
+export async function removeTeamMember(companyId: string, userId: string): Promise<void> {
+  try {
+    await apolloClient.mutate({
+      mutation: REMOVE_TEAM_MEMBER,
+      variables: { companyId, userId },
+      context: await authContext(),
+    });
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not remove team member.'));
+  }
+}
+
 export interface HousePlan {
   id: string;
   file_name: string;
@@ -53,10 +255,13 @@ export interface HousePlan {
   created_at: string;
 }
 
-export async function listHousePlans(): Promise<HousePlan[]> {
+/** Plans for the given company. RLS permits any company the user belongs to, so companyId
+ *  scopes this to the active one rather than mixing every company's plans together. */
+export async function listHousePlans(companyId: string): Promise<HousePlan[]> {
   const { data, error } = await supabase
     .from('house_plans')
     .select('id, file_name, name, storage_path, file_size, content_type, created_at')
+    .eq('company_id', companyId)
     .order('created_at', { ascending: true });
   if (error) throw error;
   return data ?? [];
@@ -361,10 +566,23 @@ function gqlExtensions(error: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
-/** Authorization header carrying the current Supabase access token, for GraphQL calls. */
+/** The active company id, kept in sync by CompanyProvider (company-context.tsx). Module-level
+ *  rather than passed per-call so every existing authContext()-based GraphQL call picks it up
+ *  automatically; resolvers mostly derive company_id from the resource itself anyway, and use
+ *  this header only where there's no resource to derive it from. */
+let activeCompanyIdForRequests: string | null = null;
+
+/** Called by CompanyProvider whenever the active company changes. Not for direct use elsewhere. */
+export function setActiveCompanyIdForRequests(companyId: string | null): void {
+  activeCompanyIdForRequests = companyId;
+}
+
+/** Authorization + active-company headers for GraphQL calls. */
 async function authContext(): Promise<{ headers: Record<string, string> }> {
   const { data: { session } } = await supabase.auth.getSession();
-  return { headers: { Authorization: `Bearer ${session?.access_token ?? supabaseKey}` } };
+  const headers: Record<string, string> = { Authorization: `Bearer ${session?.access_token ?? supabaseKey}` };
+  if (activeCompanyIdForRequests) headers['X-Company-Id'] = activeCompanyIdForRequests;
+  return { headers };
 }
 
 export type TakeoffPhase = 'reading' | 'analyzing' | 'compiling' | 'saving';
@@ -1007,6 +1225,11 @@ export interface BillingSettings {
   autoTopupThresholdCents: number | null;
   autoTopupTargetCents: number | null;
   autoTopupDisabledReason: string | null;
+  plan: 'per_bid' | 'monthly';
+  subscriptionStatus: string | null;
+  subscriptionCancelAtPeriodEnd: boolean;
+  subscriptionCurrentPeriodEnd: string | null;
+  monthlyPlanPriceCents: number;
 }
 
 const BILLING_SETTINGS_FIELDS = `
@@ -1017,6 +1240,11 @@ const BILLING_SETTINGS_FIELDS = `
   autoTopupThresholdCents
   autoTopupTargetCents
   autoTopupDisabledReason
+  plan
+  subscriptionStatus
+  subscriptionCancelAtPeriodEnd
+  subscriptionCurrentPeriodEnd
+  monthlyPlanPriceCents
 `;
 
 const BILLING_SETTINGS = gql`
@@ -1121,9 +1349,89 @@ export async function removeSavedCard(): Promise<BillingSettings> {
   }
 }
 
-/** Fetches all saved plans and generates a takeoff for each, scoped to the given trades. */
-export async function performTakeoffs(trades: string[]): Promise<Takeoff[]> {
-  const plans = await listHousePlans();
+const CREATE_SUBSCRIPTION_CHECKOUT = gql`
+  mutation CreateSubscriptionCheckout {
+    createSubscriptionCheckout {
+      url
+    }
+  }
+`;
+
+/** Creates a Stripe Checkout session (subscription mode) for the monthly plan; returns the hosted URL to redirect to. */
+export async function createSubscriptionCheckout(): Promise<string> {
+  try {
+    const { data } = await apolloClient.mutate<{ createSubscriptionCheckout: { url: string } }>({
+      mutation: CREATE_SUBSCRIPTION_CHECKOUT,
+      context: await authContext(),
+    });
+    return data!.createSubscriptionCheckout.url;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not start checkout.'));
+  }
+}
+
+const CONFIRM_SUBSCRIPTION_CHECKOUT = gql`
+  mutation ConfirmSubscriptionCheckout($sessionId: String!) {
+    confirmSubscriptionCheckout(sessionId: $sessionId) { ${BILLING_SETTINGS_FIELDS} }
+  }
+`;
+
+/** Confirms a returned subscription Checkout session and syncs the plan (idempotent). */
+export async function confirmSubscriptionCheckout(sessionId: string): Promise<BillingSettings> {
+  try {
+    const { data } = await apolloClient.mutate<{ confirmSubscriptionCheckout: BillingSettings }>({
+      mutation: CONFIRM_SUBSCRIPTION_CHECKOUT,
+      variables: { sessionId },
+      context: await authContext(),
+    });
+    return data!.confirmSubscriptionCheckout;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not confirm subscription.'));
+  }
+}
+
+const CANCEL_SUBSCRIPTION = gql`
+  mutation CancelSubscription {
+    cancelSubscription { ${BILLING_SETTINGS_FIELDS} }
+  }
+`;
+
+/** Cancels the monthly plan at the end of the current billing period. */
+export async function cancelSubscription(): Promise<BillingSettings> {
+  try {
+    const { data } = await apolloClient.mutate<{ cancelSubscription: BillingSettings }>({
+      mutation: CANCEL_SUBSCRIPTION,
+      context: await authContext(),
+    });
+    return data!.cancelSubscription;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not cancel plan.'));
+  }
+}
+
+const RESUME_SUBSCRIPTION = gql`
+  mutation ResumeSubscription {
+    resumeSubscription { ${BILLING_SETTINGS_FIELDS} }
+  }
+`;
+
+/** Undoes a pending cancellation, keeping the monthly plan active. */
+export async function resumeSubscription(): Promise<BillingSettings> {
+  try {
+    const { data } = await apolloClient.mutate<{ resumeSubscription: BillingSettings }>({
+      mutation: RESUME_SUBSCRIPTION,
+      context: await authContext(),
+    });
+    return data!.resumeSubscription;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not resume plan.'));
+  }
+}
+
+/** Fetches all saved plans in the given company and generates a takeoff for each, scoped
+ *  to the given trades. */
+export async function performTakeoffs(companyId: string, trades: string[]): Promise<Takeoff[]> {
+  const plans = await listHousePlans(companyId);
   return Promise.all(plans.map((plan) => generateTakeoff(plan.id, trades)));
 }
 
@@ -1132,17 +1440,36 @@ const DEFAULT_PRICING_MATRIX: PricingMatrix = {
   tradeOverrides: [],
 };
 
-export async function loadSettings(): Promise<UserSettings> {
-  const { data, error } = await supabase
-    .from('user_settings')
-    .select('pricing_matrix, trades, dismissed_notices, bid_sharing_mode')
-    .maybeSingle();
-  if (error) throw error;
+/** Loads settings for the active company: pricing_matrix/trades/bid_sharing_mode from
+ *  company_settings (shared, member-editable business policy) merged with dismissed_notices
+ *  from user_preferences (personal, per-user UI preference — independent of company). */
+export async function loadSettings(companyId: string): Promise<UserSettings> {
+  const [{ data: companySettings, error: companyError }, { data: { user } }] = await Promise.all([
+    supabase
+      .from('company_settings')
+      .select('pricing_matrix, trades, bid_sharing_mode')
+      .eq('company_id', companyId)
+      .maybeSingle(),
+    supabase.auth.getUser(),
+  ]);
+  if (companyError) throw companyError;
+
+  let dismissedNotices: string[] = [];
+  if (user) {
+    const { data: prefs, error: prefsError } = await supabase
+      .from('user_preferences')
+      .select('dismissed_notices')
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (prefsError) throw prefsError;
+    dismissedNotices = (prefs?.dismissed_notices as string[]) ?? [];
+  }
+
   return {
-    pricingMatrix: (data?.pricing_matrix as PricingMatrix) ?? DEFAULT_PRICING_MATRIX,
-    trades: (data?.trades as string[]) ?? [],
-    dismissedNotices: (data?.dismissed_notices as string[]) ?? [],
-    bidSharingMode: (data?.bid_sharing_mode as BidSharingMode) ?? 'summary',
+    pricingMatrix: (companySettings?.pricing_matrix as PricingMatrix) ?? DEFAULT_PRICING_MATRIX,
+    trades: (companySettings?.trades as string[]) ?? [],
+    dismissedNotices,
+    bidSharingMode: (companySettings?.bid_sharing_mode as BidSharingMode) ?? 'summary',
   };
 }
 
@@ -1157,19 +1484,19 @@ export async function getLinkedSubcontractorCount(): Promise<number> {
   return count ?? 0;
 }
 
-/** Permanently dismisses a named notice for the current user. */
+/** Permanently dismisses a named notice for the current user (personal, not company-scoped). */
 export async function dismissNotice(name: string): Promise<void> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) throw new Error('Not authenticated');
   const { data: current } = await supabase
-    .from('user_settings')
+    .from('user_preferences')
     .select('dismissed_notices')
     .eq('user_id', user.id)
     .maybeSingle();
   const existing = (current?.dismissed_notices as string[]) ?? [];
   if (existing.includes(name)) return;
   const { error } = await supabase
-    .from('user_settings')
+    .from('user_preferences')
     .upsert({ user_id: user.id, dismissed_notices: [...existing, name] });
   if (error) throw error;
 }
@@ -1214,16 +1541,20 @@ export async function getLocalPricing(
   }
 }
 
-export async function saveSettings(settings: UserSettings): Promise<void> {
+/** Saves the shared, member-editable business settings (pricing/trades/sharing mode) for
+ *  the given company. dismissedNotices is intentionally not written here — it's personal,
+ *  saved separately via dismissNotice(). */
+export async function saveSettings(companyId: string, settings: UserSettings): Promise<void> {
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) throw new Error('Not authenticated');
   const { error } = await supabase
-    .from('user_settings')
+    .from('company_settings')
     .upsert({
-      user_id: user.id,
+      company_id: companyId,
       pricing_matrix: settings.pricingMatrix,
       trades: settings.trades,
       bid_sharing_mode: settings.bidSharingMode,
+      updated_by: user.id,
     });
   if (error) throw error;
 }
@@ -1239,10 +1570,11 @@ export async function getPlanSignedUrl(storagePath: string): Promise<string> {
 
 export async function uploadHousePlan(
   userId: string,
+  companyId: string,
   file: File,
 ): Promise<HousePlan> {
   const safeName = file.name.replace(/[^\w.\-()+ ]/g, '_');
-  const storagePath = `${userId}/${Date.now()}-${safeName}`;
+  const storagePath = `${companyId}/${Date.now()}-${safeName}`;
 
   const { error: uploadError } = await supabase.storage
     .from(HOUSE_PLANS_BUCKET)
@@ -1253,6 +1585,7 @@ export async function uploadHousePlan(
     .from('house_plans')
     .insert({
       user_id: userId,
+      company_id: companyId,
       file_name: file.name,
       storage_path: storagePath,
       file_size: file.size,
@@ -1300,11 +1633,14 @@ function rowToSub(row: SubcontractorRow): Subcontractor {
 
 const SUB_COLUMNS = 'id, name, trades, contact_email, contact_phone, contact_address, created_at';
 
-export async function listSubcontractors(): Promise<Subcontractor[]> {
+/** Subcontractors for the given company. RLS permits any company the user belongs to, so
+ *  companyId scopes this to the active one rather than mixing every company's subs together. */
+export async function listSubcontractors(companyId: string): Promise<Subcontractor[]> {
   const { data: { user } } = await supabase.auth.getUser();
   const { data, error } = await supabase
     .from('subcontractors')
     .select(SUB_COLUMNS)
+    .eq('company_id', companyId)
     // Exclude records where the current user IS the subcontractor — those are
     // entries created by other contractors and should not appear in their own list.
     .or(user ? `linked_user_id.is.null,linked_user_id.neq.${user.id}` : 'linked_user_id.is.null')
@@ -1314,6 +1650,7 @@ export async function listSubcontractors(): Promise<Subcontractor[]> {
 }
 
 export async function createSubcontractor(
+  companyId: string,
   input: Omit<Subcontractor, 'id' | 'createdAt'>,
 ): Promise<Subcontractor> {
   const { data: { user } } = await supabase.auth.getUser();
@@ -1322,6 +1659,7 @@ export async function createSubcontractor(
     .from('subcontractors')
     .insert({
       user_id: user.id,
+      company_id: companyId,
       name: input.name,
       trades: input.trades,
       contact_email: input.contactEmail ?? null,

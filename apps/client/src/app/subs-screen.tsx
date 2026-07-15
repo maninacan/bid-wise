@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { TRADES } from '@bid-wise/data';
 import type { Subcontractor } from '../lib/supabase';
 import { createSubcontractor, deleteSubcontractor, updateSubcontractor } from '../lib/supabase';
+import { useCompany } from '../lib/company-context';
 
 // ── Subcontractor form modal ──────────────────────────────────────────────────
 
@@ -13,6 +14,7 @@ interface SubFormModalProps {
 }
 
 export function SubcontractorFormModal({ initial, initialTrade, onSaved, onClose }: SubFormModalProps) {
+  const { activeCompanyId } = useCompany();
   const [name, setName] = useState(initial?.name ?? '');
   const [selectedTrades, setSelectedTrades] = useState<Set<string>>(
     new Set(initial?.trades ?? (initialTrade ? [initialTrade] : [])),
@@ -41,6 +43,7 @@ export function SubcontractorFormModal({ initial, initialTrade, onSaved, onClose
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) { setError('Name is required.'); return; }
+    if (!initial && !activeCompanyId) { setError('No active company.'); return; }
     setSaving(true);
     setError(null);
     try {
@@ -53,7 +56,7 @@ export function SubcontractorFormModal({ initial, initialTrade, onSaved, onClose
       };
       const saved = initial
         ? await updateSubcontractor(initial.id, payload)
-        : await createSubcontractor(payload);
+        : await createSubcontractor(activeCompanyId!, payload);
       onSaved(saved);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Save failed.');

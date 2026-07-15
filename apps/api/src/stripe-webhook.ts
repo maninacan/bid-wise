@@ -5,7 +5,7 @@
 import type { Request, Response } from 'express';
 import { getStripe } from './lib/stripe';
 import { supabaseAdmin } from './lib/supabase-admin';
-import { creditTopup, persistCardFromSetupIntent } from './billing';
+import { creditTopup, persistCardFromSetupIntent, syncSubscriptionFromStripe, type StripeSubscriptionLike } from './billing';
 
 /** The Checkout session fields this handler reads. */
 interface TopupSession {
@@ -13,6 +13,12 @@ interface TopupSession {
   metadata?: Record<string, string> | null;
   payment_status?: string | null;
   amount_total?: number | null;
+}
+
+/** The Subscription fields this handler reads off a subscription.updated/deleted event
+ *  (metadata carries userId, set at checkout creation via subscription_data.metadata). */
+interface SubscriptionEventObject extends StripeSubscriptionLike {
+  metadata?: Record<string, string> | null;
 }
 
 export async function stripeWebhookHandler(req: Request, res: Response): Promise<void> {
@@ -55,6 +61,18 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
         if (full.setup_intent && typeof full.setup_intent !== 'string') {
           await persistCardFromSetupIntent(supabaseAdmin, userId, full.setup_intent);
         }
+      } else if (session.metadata?.kind === 'subscription' && userId) {
+        // Backup path in case the browser never returns to confirmSubscriptionCheckout after redirect.
+        const full = await getStripe().checkout.sessions.retrieve(session.id, { expand: ['subscription'] });
+        if (full.subscription && typeof full.subscription !== 'string') {
+          await syncSubscriptionFromStripe(supabaseAdmin, userId, full.subscription);
+        }
+      }
+    } else if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object as unknown as SubscriptionEventObject;
+      const userId = subscription.metadata?.userId;
+      if (userId) {
+        await syncSubscriptionFromStripe(supabaseAdmin, userId, subscription);
       }
     }
   } catch (err) {

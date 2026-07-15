@@ -1,13 +1,17 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  cancelSubscription,
   confirmCardSetup,
+  confirmSubscriptionCheckout,
   confirmTopup,
   createCreditCheckout,
+  createSubscriptionCheckout,
   getBillingSettings,
   getCreditBalanceCents,
   getStripeTestMode,
   removeSavedCard,
+  resumeSubscription,
   startCardSetup,
   updateAutoTopup,
   type BillingSettings,
@@ -80,6 +84,8 @@ export function BillingScreen() {
   const [targetInput, setTargetInput] = useState('');
   const [autoTopupError, setAutoTopupError] = useState<string | null>(null);
   const [savingAutoTopup, setSavingAutoTopup] = useState(false);
+  const [planBusy, setPlanBusy] = useState(false);
+  const [planError, setPlanError] = useState<string | null>(null);
 
   const applyBillingSettings = (settings: BillingSettings) => {
     setBilling(settings);
@@ -122,6 +128,25 @@ export function BillingScreen() {
         .finally(() => navigate('/billing', { replace: true }));
     } else if (setupCanceled) {
       setNotice({ kind: 'canceled', text: 'Card setup canceled.' });
+      navigate('/billing', { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // On return from Stripe Checkout (subscription mode): confirm the session and sync the plan.
+  useEffect(() => {
+    const subSessionId = searchParams.get('sub_session_id');
+    const subCanceled = searchParams.get('sub_canceled');
+    if (subSessionId) {
+      confirmSubscriptionCheckout(subSessionId)
+        .then((settings) => {
+          applyBillingSettings(settings);
+          setNotice({ kind: 'success', text: 'You’re on the monthly plan — bids are unlocked with no per-bid charge.' });
+        })
+        .catch((err) => setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not confirm subscription.' }))
+        .finally(() => navigate('/billing', { replace: true }));
+    } else if (subCanceled) {
+      setNotice({ kind: 'canceled', text: 'Checkout canceled — you’re still on pay-per-bid.' });
       navigate('/billing', { replace: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -216,21 +241,62 @@ export function BillingScreen() {
     }
   };
 
+  const handleSwitchToMonthly = async () => {
+    setPlanBusy(true);
+    setPlanError(null);
+    try {
+      const url = await createSubscriptionCheckout();
+      window.location.href = url; // hand off to Stripe-hosted Checkout
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Could not start checkout.');
+      setPlanBusy(false);
+    }
+  };
+
+  const handleCancelPlan = async () => {
+    setPlanBusy(true);
+    setPlanError(null);
+    try {
+      applyBillingSettings(await cancelSubscription());
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Could not cancel plan.');
+    } finally {
+      setPlanBusy(false);
+    }
+  };
+
+  const handleResumePlan = async () => {
+    setPlanBusy(true);
+    setPlanError(null);
+    try {
+      applyBillingSettings(await resumeSubscription());
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Could not resume plan.');
+    } finally {
+      setPlanBusy(false);
+    }
+  };
+
   const noticeStyles = {
     success: 'border-green-200 bg-green-50 text-green-800',
     canceled: 'border-slate-200 bg-slate-50 text-slate-600',
     error: 'border-red-200 bg-red-50 text-red-700',
   } as const;
 
+  const isMonthly = billing?.plan === 'monthly';
+  const renewalDate = billing?.subscriptionCurrentPeriodEnd
+    ? new Date(billing.subscriptionCurrentPeriodEnd).toLocaleDateString('en-US', {
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+      })
+    : null;
+
   return (
     <section className="mt-10 w-full max-w-xl">
-      <h1 className="text-xl font-semibold text-slate-800">Credits</h1>
+      <h1 className="text-xl font-semibold text-slate-800">Billing</h1>
       <p className="mt-1 text-sm text-slate-500">
-        Prepay for credits, then generate takeoffs for free. Once a takeoff is generated,
-        unlocking pricing, materials, and the final bid costs{' '}
-        <span className="font-medium text-slate-700">$0.05 per square foot</span> of the
-        plan (minimum <span className="font-medium text-slate-700">$15</span>) — charged
-        once per project.
+        Choose how you pay for takeoffs — meter every bid, or go flat-rate for unlimited bids.
       </p>
 
       {notice && (
@@ -238,6 +304,91 @@ export function BillingScreen() {
           {notice.text}
         </div>
       )}
+
+      <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+        <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Plan</p>
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div
+            className={`rounded-xl border-2 p-4 ${
+              !isMonthly ? 'border-blue-400 bg-blue-50/40' : 'border-slate-200'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-semibold text-slate-800">Pay per bid</p>
+              {!isMonthly && (
+                <span className="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-[11px] font-medium text-blue-700">
+                  Current plan
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-slate-500">
+              <span className="font-medium text-slate-700">$0.05/sq ft</span>, $15 minimum —
+              charged once per project when you unlock Materials, Pricing, and the Bid.
+            </p>
+          </div>
+
+          <div
+            className={`rounded-xl border-2 p-4 ${
+              isMonthly ? 'border-blue-400 bg-blue-50/40' : 'border-slate-200'
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-semibold text-slate-800">Monthly unlimited</p>
+              {isMonthly && (
+                <span className="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-[11px] font-medium text-blue-700">
+                  Current plan
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-slate-500">
+              <span className="font-medium text-slate-700">
+                {billing ? fmtUsd(billing.monthlyPlanPriceCents) : '—'}/mo
+              </span>{' '}
+              — unlimited bids, any size, no per-bid charge.
+            </p>
+
+            {!isMonthly && (
+              <button
+                type="button"
+                onClick={handleSwitchToMonthly}
+                disabled={planBusy}
+                className="mt-3 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:opacity-50"
+              >
+                {planBusy ? 'Redirecting…' : 'Switch to monthly'}
+              </button>
+            )}
+
+            {isMonthly && !billing?.subscriptionCancelAtPeriodEnd && (
+              <div className="mt-3">
+                {renewalDate && <p className="text-xs text-slate-400">Renews {renewalDate}</p>}
+                <button
+                  type="button"
+                  onClick={handleCancelPlan}
+                  disabled={planBusy}
+                  className="mt-2 text-xs font-medium text-red-500 hover:text-red-600 disabled:opacity-40"
+                >
+                  {planBusy ? 'Canceling…' : 'Cancel plan'}
+                </button>
+              </div>
+            )}
+
+            {isMonthly && billing?.subscriptionCancelAtPeriodEnd && (
+              <div className="mt-3">
+                {renewalDate && <p className="text-xs text-amber-600">Ends {renewalDate}</p>}
+                <button
+                  type="button"
+                  onClick={handleResumePlan}
+                  disabled={planBusy}
+                  className="mt-2 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:opacity-50"
+                >
+                  {planBusy ? 'Resuming…' : 'Resume plan'}
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+        {planError && <p className="mt-3 text-xs text-red-600">{planError}</p>}
+      </div>
 
       <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
         <p className="text-xs font-medium uppercase tracking-wide text-slate-400">Balance</p>

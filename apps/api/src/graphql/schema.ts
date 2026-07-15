@@ -21,6 +21,49 @@ export const typeDefs = `#graphql
 
     "Saved-card and auto top-up configuration for the signed-in user."
     billingSettings: BillingSettings!
+
+    "Companies the signed-in user belongs to, with their role in each."
+    myCompanies: [CompanyMembership!]!
+
+    "Members of a company. Caller must be a member."
+    companyMembers(companyId: ID!): [CompanyMember!]!
+
+    "Invites (any status) for a company, newest first. Caller must be a member."
+    companyInvites(companyId: ID!): [CompanyInvite!]!
+
+    "Pending, unexpired invites addressed to the signed-in user's own email."
+    myPendingInvites: [CompanyInvite!]!
+  }
+
+  type Company {
+    id: ID!
+    name: String!
+    billingEmail: String
+    createdAt: String!
+  }
+
+  type CompanyMembership {
+    company: Company!
+    role: String!
+  }
+
+  type CompanyMember {
+    userId: ID!
+    email: String!
+    role: String!
+    joinedAt: String!
+  }
+
+  type CompanyInvite {
+    id: ID!
+    companyId: ID!
+    email: String!
+    role: String!
+    status: String!
+    createdAt: String!
+    expiresAt: String!
+    "Accept token. Only ever populated on myPendingInvites (already scoped to the caller's own verified email) — null on companyInvites' owner-facing roster."
+    token: ID
   }
 
   type BillingSettings {
@@ -34,6 +77,16 @@ export const typeDefs = `#graphql
     autoTopupTargetCents: Int
     "Set when the last automatic charge failed; cleared once the card or settings are updated."
     autoTopupDisabledReason: String
+    "'per_bid' (default, metered) or 'monthly' (flat-rate unlimited bids)."
+    plan: String!
+    "Mirrors Stripe's subscription status (active, trialing, past_due, canceled, ...); null if never subscribed."
+    subscriptionStatus: String
+    "True once cancelSubscription has been called — plan reverts to per_bid at period end."
+    subscriptionCancelAtPeriodEnd: Boolean!
+    "When the current monthly billing period ends (ISO string); null if never subscribed."
+    subscriptionCurrentPeriodEnd: String
+    "Flat monthly price, in cents, for the unlimited-bids plan."
+    monthlyPlanPriceCents: Int!
   }
 
   type AdminDashboardStats {
@@ -177,5 +230,32 @@ export const typeDefs = `#graphql
 
     "Stamp a paid bid as finalized (locked) — no charge; payment already happened via payForTakeoff."
     finalizeBid(takeoffId: ID!): FinalizeResult!
+
+    "Creates a Stripe Checkout session (subscription mode) for the monthly unlimited-bids plan."
+    createSubscriptionCheckout: CheckoutSession!
+
+    "Confirms a returned subscription Checkout session and syncs the plan (idempotent)."
+    confirmSubscriptionCheckout(sessionId: String!): BillingSettings!
+
+    "Cancels the monthly plan at the end of the current billing period."
+    cancelSubscription: BillingSettings!
+
+    "Undoes a pending cancellation, keeping the monthly plan active."
+    resumeSubscription: BillingSettings!
+
+    "Creates a new company with the caller as its owner."
+    createCompany(name: String!): Company!
+
+    "Invites a teammate by email. Owner-only."
+    inviteTeamMember(companyId: ID!, email: String!): CompanyInvite!
+
+    "Revokes a pending invite. Owner-only."
+    revokeInvite(inviteId: ID!): OkResult!
+
+    "Accepts a pending invite addressed to the signed-in user's own email, joining that company."
+    acceptInvite(token: ID!): Company!
+
+    "Removes a team member from a company. Owner-only; blocked if it would remove the last owner."
+    removeTeamMember(companyId: ID!, userId: ID!): OkResult!
   }
 `;

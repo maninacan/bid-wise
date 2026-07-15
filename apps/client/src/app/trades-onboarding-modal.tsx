@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { UserSettings } from '../lib/supabase';
 import { saveSettings } from '../lib/supabase';
+import { useCompany } from '../lib/company-context';
 import { TradesSelectorGrid } from './settings-panel';
 
 interface TradesOnboardingModalProps {
@@ -9,6 +10,7 @@ interface TradesOnboardingModalProps {
 }
 
 export function TradesOnboardingModal({ settings, onSaved }: TradesOnboardingModalProps) {
+  const { activeCompanyId } = useCompany();
   const [selected, setSelected] = useState<Set<string>>(new Set(settings.trades));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -16,11 +18,12 @@ export function TradesOnboardingModal({ settings, onSaved }: TradesOnboardingMod
   const toggle = (next: Set<string>) => setSelected(next);
 
   const handleSave = async () => {
+    if (!activeCompanyId) return;
     setSaving(true);
     setError(null);
     try {
       const updated: UserSettings = { ...settings, trades: [...selected] };
-      await saveSettings(updated);
+      await saveSettings(activeCompanyId, updated);
       onSaved(updated);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Save failed.');

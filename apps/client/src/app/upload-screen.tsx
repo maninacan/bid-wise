@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import { uploadHousePlan, type HousePlan } from '../lib/supabase';
+import { useCompany } from '../lib/company-context';
 
 interface UploadScreenProps {
   userId: string;
@@ -7,18 +8,20 @@ interface UploadScreenProps {
 }
 
 export function UploadScreen({ userId, onContinue }: UploadScreenProps) {
+  const { activeCompanyId } = useCompany();
   const [uploading, setUploading] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = async (files: FileList | File[]) => {
+    if (!activeCompanyId) return;
     setError(null);
     setUploading(true);
     try {
       const uploaded: HousePlan[] = [];
       for (const file of Array.from(files)) {
-        uploaded.push(await uploadHousePlan(userId, file));
+        uploaded.push(await uploadHousePlan(userId, activeCompanyId, file));
       }
       onContinue(uploaded);
     } catch (err) {

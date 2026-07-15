@@ -171,11 +171,20 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
 
     const { data: plan, error: planError } = await supabase
       .from('house_plans')
-      .select('id, file_name, storage_path')
+      .select('id, file_name, storage_path, company_id')
       .eq('id', plan_id)
-      .eq('user_id', user.id)
       .single();
     if (planError || !plan) {
+      write({ type: 'error', error: 'Plan not found.' });
+      return;
+    }
+    const { data: membership } = await supabase
+      .from('company_members')
+      .select('user_id')
+      .eq('company_id', plan.company_id)
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (!membership) {
       write({ type: 'error', error: 'Plan not found.' });
       return;
     }
@@ -194,12 +203,14 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
       return;
     }
 
-    // Per-plan lock: refuse if a non-stale job is already running for this plan.
+    // Per-plan lock: refuse if a non-stale job is already running for this plan, from ANY
+    // member of the company (not just this user) — the underlying unique index is keyed on
+    // (company_id, plan_id), since multiple teammates can now act on the same project.
     // A stale running row (crashed server) is finalized to free the unique slot.
     const { data: existing } = await supabase
       .from('takeoff_jobs')
       .select('id, updated_at')
-      .eq('user_id', user.id)
+      .eq('company_id', plan.company_id)
       .eq('plan_id', plan_id)
       .eq('status', 'running')
       .order('updated_at', { ascending: false })
@@ -219,7 +230,7 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
 
     const { data: job, error: jobError } = await supabase
       .from('takeoff_jobs')
-      .insert({ user_id: user.id, plan_id, status: 'running', phase: 'reading', trades: trades ?? [] })
+      .insert({ user_id: user.id, company_id: plan.company_id, plan_id, status: 'running', phase: 'reading', trades: trades ?? [] })
       .select('id')
       .single();
     if (jobError || !job) {
@@ -488,7 +499,7 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
     setPhase('saving');
     const { data: savedTakeoff, error: insertError } = await supabase
       .from('takeoffs')
-      .insert({ user_id: user.id, plan_id, model, data: takeoffData })
+      .insert({ user_id: user.id, company_id: plan.company_id, plan_id, model, data: takeoffData })
       .select('id, plan_id, model, data, created_at')
       .single();
 
@@ -500,6 +511,7 @@ export async function generateTakeoffHandler(req: Request, res: Response): Promi
 
     await trackUsage(supabase, {
       user_id: user.id,
+      company_id: plan.company_id,
       plan_id,
       takeoff_id: savedTakeoff.id,
       operation: 'generate-takeoff',
@@ -565,10 +577,24 @@ export async function cancelTakeoffHandler(req: Request, res: Response): Promise
     return;
   }
 
+  const { data: plan } = await supabaseAdmin.from('house_plans').select('company_id').eq('id', plan_id).maybeSingle();
+  const { data: membership } = plan
+    ? await supabaseAdmin
+        .from('company_members')
+        .select('user_id')
+        .eq('company_id', plan.company_id)
+        .eq('user_id', user.id)
+        .maybeSingle()
+    : { data: null };
+  if (!plan || !membership) {
+    res.status(404).json({ error: 'Plan not found.' });
+    return;
+  }
+
   const { data: job, error } = await supabaseAdmin
     .from('takeoff_jobs')
     .update({ cancel_requested: true, updated_at: new Date().toISOString() })
-    .eq('user_id', user.id)
+    .eq('company_id', plan.company_id)
     .eq('plan_id', plan_id)
     .eq('status', 'running')
     .select('id')

@@ -18,16 +18,31 @@ export async function getBalanceCents(supabase: SupabaseClient, userId: string):
   return data?.balance_cents ?? 0;
 }
 
-/** True once a takeoff has been paid for (a `charge` row exists) via payForTakeoff. */
+/**
+ * True once a takeoff is unlocked for Materials/Pricing/Bid: either it was already charged (a
+ * `charge` row exists, via payForTakeoff) or the takeoff owner currently has an active monthly
+ * plan. Owner-scoped rather than caller-scoped so this stays correct when a delegated
+ * subcontractor (not the GC) is the one calling a paid-gated resolver.
+ */
 export async function isTakeoffPaid(supabase: SupabaseClient, takeoffId: string): Promise<boolean> {
-  const { data, error } = await supabase
+  const { data: charge, error: chargeError } = await supabase
     .from('credit_transactions')
     .select('id')
     .eq('takeoff_id', takeoffId)
     .eq('kind', 'charge')
     .maybeSingle();
-  if (error) throw error;
-  return !!data;
+  if (chargeError) throw chargeError;
+  if (charge) return true;
+
+  const { data: takeoff, error: takeoffError } = await supabase
+    .from('takeoffs')
+    .select('user_id')
+    .eq('id', takeoffId)
+    .maybeSingle();
+  if (takeoffError) throw takeoffError;
+  if (!takeoff) return false;
+
+  return hasActiveMonthlySubscription(await getBillingCustomer(supabase, takeoff.user_id));
 }
 
 /** Idempotently credit a paid Stripe Checkout session to the user's balance. Safe to call
@@ -57,6 +72,19 @@ export interface BillingCustomer {
   autoTopupThresholdCents: number | null;
   autoTopupTargetCents: number | null;
   autoTopupDisabledReason: string | null;
+  plan: 'per_bid' | 'monthly';
+  stripeSubscriptionId: string | null;
+  subscriptionStatus: string | null;
+  subscriptionCancelAtPeriodEnd: boolean;
+  subscriptionCurrentPeriodEnd: string | null;
+}
+
+/** True when the customer's monthly plan currently covers bids without a per-bid charge. */
+export function hasActiveMonthlySubscription(customer: BillingCustomer | null): boolean {
+  return (
+    customer?.plan === 'monthly' &&
+    (customer.subscriptionStatus === 'active' || customer.subscriptionStatus === 'trialing')
+  );
 }
 
 export async function getBillingCustomer(
@@ -79,6 +107,11 @@ export async function getBillingCustomer(
     autoTopupThresholdCents: data.auto_topup_threshold_cents,
     autoTopupTargetCents: data.auto_topup_target_cents,
     autoTopupDisabledReason: data.auto_topup_disabled_reason,
+    plan: data.plan,
+    stripeSubscriptionId: data.stripe_subscription_id,
+    subscriptionStatus: data.subscription_status,
+    subscriptionCancelAtPeriodEnd: data.subscription_cancel_at_period_end,
+    subscriptionCurrentPeriodEnd: data.subscription_current_period_end,
   };
 }
 
@@ -178,6 +211,48 @@ export async function removeSavedCard(supabase: SupabaseClient, userId: string):
       card_last4: null,
       auto_topup_enabled: false,
       auto_topup_disabled_reason: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('user_id', userId);
+  if (error) throw error;
+}
+
+// ── Monthly plan / subscription ──────────────────────────────────────────────
+
+/**
+ * The Stripe Subscription fields syncSubscriptionFromStripe reads, kept as a minimal structural
+ * type (rather than importing Stripe.Subscription) so both the real SDK object and the webhook's
+ * raw event payload satisfy it without a cast. `current_period_end` lives on the subscription's
+ * line item, not the subscription itself, as of the API version this SDK targets.
+ */
+export interface StripeSubscriptionLike {
+  id: string;
+  status: string;
+  cancel_at_period_end: boolean;
+  items: { data: { current_period_end: number }[] };
+}
+
+/**
+ * Idempotently syncs a Stripe Subscription onto billing_customers. Called from both the
+ * confirm-on-return mutation and the webhook (checkout.session.completed, subscription.updated,
+ * subscription.deleted) — always the single source of truth for `plan`, so it can only ever be
+ * 'monthly' when Stripe currently reports the subscription active/trialing.
+ */
+export async function syncSubscriptionFromStripe(
+  supabase: SupabaseClient,
+  userId: string,
+  subscription: StripeSubscriptionLike,
+): Promise<void> {
+  const active = subscription.status === 'active' || subscription.status === 'trialing';
+  const periodEnd = subscription.items.data[0]?.current_period_end;
+  const { error } = await supabase
+    .from('billing_customers')
+    .update({
+      plan: active ? 'monthly' : 'per_bid',
+      stripe_subscription_id: subscription.id,
+      subscription_status: subscription.status,
+      subscription_cancel_at_period_end: subscription.cancel_at_period_end,
+      subscription_current_period_end: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
       updated_at: new Date().toISOString(),
     })
     .eq('user_id', userId);

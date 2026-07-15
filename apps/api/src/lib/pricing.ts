@@ -10,6 +10,9 @@ export const SQFT_RATE_CENTS = 5; // $0.05/sq ft
 /** Minimum charge per bid, in cents, regardless of square footage. */
 export const MIN_PRICE_CENTS = 1500; // $15
 
+/** Flat monthly price, in cents, for the unlimited-bids subscription plan. */
+export const MONTHLY_PLAN_PRICE_CENTS = 14900; // $149/mo
+
 /** Shown to the GC when a takeoff has no usable square footage to price from. */
 export const INVALID_SQUARE_FEET_MESSAGE =
   "This takeoff doesn't have usable square footage yet. Open the Takeoff tab, check the " +

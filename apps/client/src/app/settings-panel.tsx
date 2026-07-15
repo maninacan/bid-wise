@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { TRADES } from '@bid-wise/data';
 import type { BidSharingMode, UserSettings } from '../lib/supabase';
 import { saveSettings } from '../lib/supabase';
+import { useCompany } from '../lib/company-context';
 
 interface TradesSelectorGridProps {
   selected: Set<string>;
@@ -50,6 +51,7 @@ interface SettingsPanelProps {
 type SettingsTab = 'trades' | 'sharing';
 
 export function SettingsPanel({ settings, onClose, onSaved }: SettingsPanelProps) {
+  const { activeCompanyId } = useCompany();
   const [activeTab, setActiveTab] = useState<SettingsTab>('trades');
   const [selectedTrades, setSelectedTrades] = useState<Set<string>>(
     new Set(settings.trades),
@@ -64,6 +66,7 @@ export function SettingsPanel({ settings, onClose, onSaved }: SettingsPanelProps
   const toggleTrade = (next: Set<string>) => setSelectedTrades(next);
 
   const handleSave = async () => {
+    if (!activeCompanyId) { setSaveError('No active company.'); return; }
     setSaving(true);
     setSaveError(null);
     try {
@@ -73,7 +76,7 @@ export function SettingsPanel({ settings, onClose, onSaved }: SettingsPanelProps
         dismissedNotices: settings.dismissedNotices,
         bidSharingMode,
       };
-      await saveSettings(updatedSettings);
+      await saveSettings(activeCompanyId, updatedSettings);
       setSavedAt(new Date());
       onSaved(updatedSettings);
     } catch (err) {
