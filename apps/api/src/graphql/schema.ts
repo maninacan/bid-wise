@@ -15,6 +15,9 @@ export const typeDefs = `#graphql
 
     "Aggregate usage/revenue stats for the super-admin dashboard. SuperAdmin role required."
     adminDashboardStats: AdminDashboardStats!
+
+    "True if the server's Stripe key is a test-mode key (sk_test_...)."
+    stripeTestMode: Boolean!
   }
 
   type AdminDashboardStats {

@@ -887,6 +887,22 @@ const BID_QUOTE = gql`
   }
 `;
 
+const STRIPE_TEST_MODE = gql`
+  query StripeTestMode {
+    stripeTestMode
+  }
+`;
+
+/** True if the server's Stripe key is a test-mode key — drives the "Test mode." label on the billing screen. */
+export async function getStripeTestMode(): Promise<boolean> {
+  const { data } = await apolloClient.query<{ stripeTestMode: boolean }>({
+    query: STRIPE_TEST_MODE,
+    context: await authContext(),
+    fetchPolicy: 'network-only',
+  });
+  return data!.stripeTestMode;
+}
+
 /** Square footage, price, paid-status and balance for a bid — drives the payment gate
  *  in front of Materials/Pricing/Bid. */
 export async function bidQuote(takeoffId: string): Promise<BidQuote> {

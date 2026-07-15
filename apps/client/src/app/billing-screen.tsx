@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { confirmTopup, createCreditCheckout, getCreditBalanceCents } from '../lib/supabase';
+import { confirmTopup, createCreditCheckout, getCreditBalanceCents, getStripeTestMode } from '../lib/supabase';
 
 const TOPUP_PRESETS_CENTS = [2500, 5000, 10000, 20000];
 
@@ -52,6 +52,7 @@ export function BillingScreen() {
   const [balanceCents, setBalanceCents] = useState<number | null>(null);
   const [starting, setStarting] = useState<number | null>(null);
   const [notice, setNotice] = useState<{ kind: 'success' | 'canceled' | 'error'; text: string } | null>(null);
+  const [testMode, setTestMode] = useState(false);
 
   // On return from Stripe Checkout: confirm the session (credits the balance) or note a cancel.
   useEffect(() => {
@@ -75,6 +76,10 @@ export function BillingScreen() {
 
   useEffect(() => {
     getCreditBalanceCents().then(setBalanceCents).catch(() => setBalanceCents(0));
+  }, []);
+
+  useEffect(() => {
+    getStripeTestMode().then(setTestMode).catch(() => {});
   }, []);
 
   const handleTopUp = async (amountCents: number) => {
@@ -131,7 +136,9 @@ export function BillingScreen() {
             </button>
           ))}
         </div>
-        <p className="mt-3 text-xs text-slate-400">Secure payment via Stripe. Test mode.</p>
+        <p className="mt-3 text-xs text-slate-400">
+          Secure payment via Stripe.{testMode && ' Test mode.'}
+        </p>
       </div>
     </section>
   );

@@ -626,6 +626,10 @@ async function creditBalanceCents(_: unknown, __: unknown, ctx: GqlContext): Pro
   return getBalanceCents(ctx.supabase, user.id);
 }
 
+function stripeTestMode(): boolean {
+  return (process.env.STRIPE_SECRET_KEY ?? '').startsWith('sk_test_');
+}
+
 async function bidQuote(
   _: unknown,
   { takeoffId }: { takeoffId: string },
@@ -879,6 +883,7 @@ export const resolvers = {
     creditBalanceCents,
     bidQuote,
     adminDashboardStats,
+    stripeTestMode,
   },
   Mutation: {
     clarifyTakeoff,
