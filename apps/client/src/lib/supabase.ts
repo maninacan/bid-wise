@@ -21,16 +21,20 @@ export async function signIn(email: string, password: string): Promise<Session> 
 export async function signUp(
   email: string,
   password: string,
-): Promise<{ session: Session | null; needsConfirmation: boolean }> {
+): Promise<{ session: Session | null; needsConfirmation: boolean; alreadyRegistered: boolean }> {
   const { data: { session: current } } = await supabase.auth.getSession();
   if (current?.user.is_anonymous) {
     const { data, error } = await supabase.auth.updateUser({ email, password });
     if (error) throw error;
-    return { session: data.user ? current : null, needsConfirmation: !data.user };
+    return { session: data.user ? current : null, needsConfirmation: !data.user, alreadyRegistered: false };
   }
   const { data, error } = await supabase.auth.signUp({ email, password });
   if (error) throw error;
-  return { session: data.session ?? null, needsConfirmation: !data.session };
+  // Supabase's anti-enumeration behavior: signing up with an email that already has a
+  // confirmed account returns a user with an empty `identities` array and no session,
+  // rather than a distinct error — that's the only signal that it's already registered.
+  const alreadyRegistered = !!data.user && !data.session && (data.user.identities?.length ?? 0) === 0;
+  return { session: data.session ?? null, needsConfirmation: !data.session, alreadyRegistered };
 }
 
 export async function signOut(): Promise<void> {

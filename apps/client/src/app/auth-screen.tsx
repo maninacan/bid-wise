@@ -30,8 +30,12 @@ export function AuthScreen({ hasAnonymousData }: AuthScreenProps) {
         await signIn(email.trim(), password);
         // onAuthStateChange in app.tsx handles the rest
       } else {
-        await signUp(email.trim(), password);
-        setConfirmed(true);
+        const { alreadyRegistered } = await signUp(email.trim(), password);
+        if (alreadyRegistered) {
+          setError('An account with this email already exists. Try signing in instead.');
+        } else {
+          setConfirmed(true);
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong.');

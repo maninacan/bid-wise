@@ -807,6 +807,10 @@ async function startCardSetup(_: unknown, __: unknown, ctx: GqlContext): Promise
   const session = await getStripe().checkout.sessions.create({
     mode: 'setup',
     customer: customerId,
+    // Restrict to card: avoids Stripe requiring a `currency` param to resolve eligibility
+    // for other enabled payment method types, and matches what runAutoTopupIfNeeded expects
+    // (an off-session card charge) when it later uses the saved payment method.
+    payment_method_types: ['card'],
     metadata: { userId: user.id, kind: 'card_setup' },
     success_url: `${appUrl()}/billing?setup_session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${appUrl()}/billing?setup_canceled=1`,
