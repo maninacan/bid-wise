@@ -7,6 +7,10 @@
     "supabase-dev": {
       "type": "http",
       "url": "https://mcp.supabase.com/mcp?project_ref=skkfgbgvusdanzsnkuri"
+    },
+    "godaddy": {
+      "url": "https://api.godaddy.com/v1/domains/mcp",
+      "transport": "streamable-http"
     }
   }
 }
