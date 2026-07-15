@@ -1088,11 +1088,13 @@ export interface BidQuote {
   balanceCents: number;
 }
 
-/** Current prepaid credit balance (cents). RLS scopes the view to the current user. */
-export async function getCreditBalanceCents(): Promise<number> {
+/** Current prepaid credit balance (cents) for the given company. RLS scopes the view to
+ *  companies the current user belongs to. */
+export async function getCreditBalanceCents(companyId: string): Promise<number> {
   const { data, error } = await supabase
-    .from('user_credit_balance')
+    .from('company_credit_balance')
     .select('balance_cents')
+    .eq('company_id', companyId)
     .maybeSingle();
   if (error) throw error;
   return (data?.balance_cents as number) ?? 0;
@@ -1174,19 +1176,19 @@ export async function payForTakeoff(takeoffId: string): Promise<{ balanceCents: 
 }
 
 const CREATE_CREDIT_CHECKOUT = gql`
-  mutation CreateCreditCheckout($amountCents: Int!) {
-    createCreditCheckout(amountCents: $amountCents) {
+  mutation CreateCreditCheckout($amountCents: Int!, $companyId: ID!) {
+    createCreditCheckout(amountCents: $amountCents, companyId: $companyId) {
       url
     }
   }
 `;
 
-/** Creates a Stripe Checkout session for a credit top-up; returns the hosted URL to redirect to. */
-export async function createCreditCheckout(amountCents: number): Promise<string> {
+/** Creates a Stripe Checkout session for a credit top-up; returns the hosted URL to redirect to. Owner-only. */
+export async function createCreditCheckout(amountCents: number, companyId: string): Promise<string> {
   try {
     const { data } = await apolloClient.mutate<{ createCreditCheckout: { url: string } }>({
       mutation: CREATE_CREDIT_CHECKOUT,
-      variables: { amountCents },
+      variables: { amountCents, companyId },
       context: await authContext(),
     });
     return data!.createCreditCheckout.url;
@@ -1196,19 +1198,19 @@ export async function createCreditCheckout(amountCents: number): Promise<string>
 }
 
 const CONFIRM_TOPUP = gql`
-  mutation ConfirmTopup($sessionId: String!) {
-    confirmTopup(sessionId: $sessionId) {
+  mutation ConfirmTopup($sessionId: String!, $companyId: ID!) {
+    confirmTopup(sessionId: $sessionId, companyId: $companyId) {
       balanceCents
     }
   }
 `;
 
-/** Confirms a returned Checkout session and credits the balance (idempotent). Returns the new balance. */
-export async function confirmTopup(sessionId: string): Promise<number> {
+/** Confirms a returned Checkout session and credits the balance (idempotent). Returns the new balance. Owner-only. */
+export async function confirmTopup(sessionId: string, companyId: string): Promise<number> {
   try {
     const { data } = await apolloClient.mutate<{ confirmTopup: { balanceCents: number } }>({
       mutation: CONFIRM_TOPUP,
-      variables: { sessionId },
+      variables: { sessionId, companyId },
       context: await authContext(),
     });
     return data!.confirmTopup.balanceCents;
@@ -1248,15 +1250,17 @@ const BILLING_SETTINGS_FIELDS = `
 `;
 
 const BILLING_SETTINGS = gql`
-  query BillingSettings {
-    billingSettings { ${BILLING_SETTINGS_FIELDS} }
+  query BillingSettings($companyId: ID!) {
+    billingSettings(companyId: $companyId) { ${BILLING_SETTINGS_FIELDS} }
   }
 `;
 
-/** Saved-card + auto top-up configuration for the current user. */
-export async function getBillingSettings(): Promise<BillingSettings> {
+/** Saved-card, plan, and auto top-up configuration for the given company. Balance/plan are
+ *  visible to any member; only owners can call the mutations below. */
+export async function getBillingSettings(companyId: string): Promise<BillingSettings> {
   const { data } = await apolloClient.query<{ billingSettings: BillingSettings }>({
     query: BILLING_SETTINGS,
+    variables: { companyId },
     context: await authContext(),
     fetchPolicy: 'network-only',
   });
@@ -1264,18 +1268,19 @@ export async function getBillingSettings(): Promise<BillingSettings> {
 }
 
 const START_CARD_SETUP = gql`
-  mutation StartCardSetup {
-    startCardSetup {
+  mutation StartCardSetup($companyId: ID!) {
+    startCardSetup(companyId: $companyId) {
       url
     }
   }
 `;
 
-/** Creates a Stripe Checkout session (setup mode) to save a card; returns the hosted URL to redirect to. */
-export async function startCardSetup(): Promise<string> {
+/** Creates a Stripe Checkout session (setup mode) to save a card; returns the hosted URL to redirect to. Owner-only. */
+export async function startCardSetup(companyId: string): Promise<string> {
   try {
     const { data } = await apolloClient.mutate<{ startCardSetup: { url: string } }>({
       mutation: START_CARD_SETUP,
+      variables: { companyId },
       context: await authContext(),
     });
     return data!.startCardSetup.url;
@@ -1285,17 +1290,17 @@ export async function startCardSetup(): Promise<string> {
 }
 
 const CONFIRM_CARD_SETUP = gql`
-  mutation ConfirmCardSetup($sessionId: String!) {
-    confirmCardSetup(sessionId: $sessionId) { ${BILLING_SETTINGS_FIELDS} }
+  mutation ConfirmCardSetup($sessionId: String!, $companyId: ID!) {
+    confirmCardSetup(sessionId: $sessionId, companyId: $companyId) { ${BILLING_SETTINGS_FIELDS} }
   }
 `;
 
-/** Confirms a returned card-setup session and saves the payment method (idempotent). */
-export async function confirmCardSetup(sessionId: string): Promise<BillingSettings> {
+/** Confirms a returned card-setup session and saves the payment method (idempotent). Owner-only. */
+export async function confirmCardSetup(sessionId: string, companyId: string): Promise<BillingSettings> {
   try {
     const { data } = await apolloClient.mutate<{ confirmCardSetup: BillingSettings }>({
       mutation: CONFIRM_CARD_SETUP,
-      variables: { sessionId },
+      variables: { sessionId, companyId },
       context: await authContext(),
     });
     return data!.confirmCardSetup;
@@ -1305,23 +1310,24 @@ export async function confirmCardSetup(sessionId: string): Promise<BillingSettin
 }
 
 const UPDATE_AUTO_TOPUP = gql`
-  mutation UpdateAutoTopup($enabled: Boolean!, $thresholdCents: Int, $targetCents: Int) {
-    updateAutoTopup(enabled: $enabled, thresholdCents: $thresholdCents, targetCents: $targetCents) {
+  mutation UpdateAutoTopup($enabled: Boolean!, $thresholdCents: Int, $targetCents: Int, $companyId: ID!) {
+    updateAutoTopup(enabled: $enabled, thresholdCents: $thresholdCents, targetCents: $targetCents, companyId: $companyId) {
       ${BILLING_SETTINGS_FIELDS}
     }
   }
 `;
 
-/** Enables/disables auto top-up. When enabling, thresholdCents/targetCents are required and a card must be saved. */
+/** Enables/disables auto top-up. When enabling, thresholdCents/targetCents are required and a card must be saved. Owner-only. */
 export async function updateAutoTopup(
   enabled: boolean,
-  thresholdCents?: number,
-  targetCents?: number,
+  thresholdCents: number | undefined,
+  targetCents: number | undefined,
+  companyId: string,
 ): Promise<BillingSettings> {
   try {
     const { data } = await apolloClient.mutate<{ updateAutoTopup: BillingSettings }>({
       mutation: UPDATE_AUTO_TOPUP,
-      variables: { enabled, thresholdCents, targetCents },
+      variables: { enabled, thresholdCents, targetCents, companyId },
       context: await authContext(),
     });
     return data!.updateAutoTopup;
@@ -1331,16 +1337,17 @@ export async function updateAutoTopup(
 }
 
 const REMOVE_SAVED_CARD = gql`
-  mutation RemoveSavedCard {
-    removeSavedCard { ${BILLING_SETTINGS_FIELDS} }
+  mutation RemoveSavedCard($companyId: ID!) {
+    removeSavedCard(companyId: $companyId) { ${BILLING_SETTINGS_FIELDS} }
   }
 `;
 
-/** Removes the saved card and turns off auto top-up. */
-export async function removeSavedCard(): Promise<BillingSettings> {
+/** Removes the saved card and turns off auto top-up. Owner-only. */
+export async function removeSavedCard(companyId: string): Promise<BillingSettings> {
   try {
     const { data } = await apolloClient.mutate<{ removeSavedCard: BillingSettings }>({
       mutation: REMOVE_SAVED_CARD,
+      variables: { companyId },
       context: await authContext(),
     });
     return data!.removeSavedCard;
@@ -1350,18 +1357,19 @@ export async function removeSavedCard(): Promise<BillingSettings> {
 }
 
 const CREATE_SUBSCRIPTION_CHECKOUT = gql`
-  mutation CreateSubscriptionCheckout {
-    createSubscriptionCheckout {
+  mutation CreateSubscriptionCheckout($companyId: ID!) {
+    createSubscriptionCheckout(companyId: $companyId) {
       url
     }
   }
 `;
 
-/** Creates a Stripe Checkout session (subscription mode) for the monthly plan; returns the hosted URL to redirect to. */
-export async function createSubscriptionCheckout(): Promise<string> {
+/** Creates a Stripe Checkout session (subscription mode) for the monthly plan; returns the hosted URL to redirect to. Owner-only. */
+export async function createSubscriptionCheckout(companyId: string): Promise<string> {
   try {
     const { data } = await apolloClient.mutate<{ createSubscriptionCheckout: { url: string } }>({
       mutation: CREATE_SUBSCRIPTION_CHECKOUT,
+      variables: { companyId },
       context: await authContext(),
     });
     return data!.createSubscriptionCheckout.url;
@@ -1371,17 +1379,17 @@ export async function createSubscriptionCheckout(): Promise<string> {
 }
 
 const CONFIRM_SUBSCRIPTION_CHECKOUT = gql`
-  mutation ConfirmSubscriptionCheckout($sessionId: String!) {
-    confirmSubscriptionCheckout(sessionId: $sessionId) { ${BILLING_SETTINGS_FIELDS} }
+  mutation ConfirmSubscriptionCheckout($sessionId: String!, $companyId: ID!) {
+    confirmSubscriptionCheckout(sessionId: $sessionId, companyId: $companyId) { ${BILLING_SETTINGS_FIELDS} }
   }
 `;
 
-/** Confirms a returned subscription Checkout session and syncs the plan (idempotent). */
-export async function confirmSubscriptionCheckout(sessionId: string): Promise<BillingSettings> {
+/** Confirms a returned subscription Checkout session and syncs the plan (idempotent). Owner-only. */
+export async function confirmSubscriptionCheckout(sessionId: string, companyId: string): Promise<BillingSettings> {
   try {
     const { data } = await apolloClient.mutate<{ confirmSubscriptionCheckout: BillingSettings }>({
       mutation: CONFIRM_SUBSCRIPTION_CHECKOUT,
-      variables: { sessionId },
+      variables: { sessionId, companyId },
       context: await authContext(),
     });
     return data!.confirmSubscriptionCheckout;
@@ -1391,16 +1399,17 @@ export async function confirmSubscriptionCheckout(sessionId: string): Promise<Bi
 }
 
 const CANCEL_SUBSCRIPTION = gql`
-  mutation CancelSubscription {
-    cancelSubscription { ${BILLING_SETTINGS_FIELDS} }
+  mutation CancelSubscription($companyId: ID!) {
+    cancelSubscription(companyId: $companyId) { ${BILLING_SETTINGS_FIELDS} }
   }
 `;
 
-/** Cancels the monthly plan at the end of the current billing period. */
-export async function cancelSubscription(): Promise<BillingSettings> {
+/** Cancels the monthly plan at the end of the current billing period. Owner-only. */
+export async function cancelSubscription(companyId: string): Promise<BillingSettings> {
   try {
     const { data } = await apolloClient.mutate<{ cancelSubscription: BillingSettings }>({
       mutation: CANCEL_SUBSCRIPTION,
+      variables: { companyId },
       context: await authContext(),
     });
     return data!.cancelSubscription;
@@ -1410,16 +1419,17 @@ export async function cancelSubscription(): Promise<BillingSettings> {
 }
 
 const RESUME_SUBSCRIPTION = gql`
-  mutation ResumeSubscription {
-    resumeSubscription { ${BILLING_SETTINGS_FIELDS} }
+  mutation ResumeSubscription($companyId: ID!) {
+    resumeSubscription(companyId: $companyId) { ${BILLING_SETTINGS_FIELDS} }
   }
 `;
 
-/** Undoes a pending cancellation, keeping the monthly plan active. */
-export async function resumeSubscription(): Promise<BillingSettings> {
+/** Undoes a pending cancellation, keeping the monthly plan active. Owner-only. */
+export async function resumeSubscription(companyId: string): Promise<BillingSettings> {
   try {
     const { data } = await apolloClient.mutate<{ resumeSubscription: BillingSettings }>({
       mutation: RESUME_SUBSCRIPTION,
+      variables: { companyId },
       context: await authContext(),
     });
     return data!.resumeSubscription;

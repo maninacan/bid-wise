@@ -16,6 +16,7 @@ import {
   updateAutoTopup,
   type BillingSettings,
 } from '../lib/supabase';
+import { useCompany } from '../lib/company-context';
 
 const TOPUP_PRESETS_CENTS = [2500, 5000, 10000, 20000, 50000, 100000];
 
@@ -33,15 +34,17 @@ export function notifyCreditsChanged() {
   window.dispatchEvent(new Event('credits-updated'));
 }
 
-/** Header chip showing the live credit balance; navigates to the billing screen. */
+/** Header chip showing the live credit balance (shared company wallet); navigates to the billing screen. */
 export function CreditsChip() {
   const navigate = useNavigate();
+  const { activeCompanyId } = useCompany();
   const [cents, setCents] = useState<number | null>(null);
 
   useEffect(() => {
+    if (!activeCompanyId) return;
     let active = true;
     const refresh = () => {
-      getCreditBalanceCents()
+      getCreditBalanceCents(activeCompanyId)
         .then((c) => active && setCents(c))
         .catch(() => {});
     };
@@ -53,7 +56,7 @@ export function CreditsChip() {
       window.removeEventListener('focus', refresh);
       window.removeEventListener('credits-updated', refresh);
     };
-  }, []);
+  }, [activeCompanyId]);
 
   return (
     <button
@@ -70,6 +73,8 @@ export function CreditsChip() {
 export function BillingScreen() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { activeCompanyId, activeCompany } = useCompany();
+  const isOwner = activeCompany?.role === 'owner';
   const [balanceCents, setBalanceCents] = useState<number | null>(null);
   const [starting, setStarting] = useState<number | null>(null);
   const [notice, setNotice] = useState<{ kind: 'success' | 'canceled' | 'error'; text: string } | null>(null);
@@ -98,8 +103,8 @@ export function BillingScreen() {
   useEffect(() => {
     const sessionId = searchParams.get('session_id');
     const canceled = searchParams.get('canceled');
-    if (sessionId) {
-      confirmTopup(sessionId)
+    if (sessionId && activeCompanyId) {
+      confirmTopup(sessionId, activeCompanyId)
         .then((cents) => {
           setBalanceCents(cents);
           notifyCreditsChanged();
@@ -118,8 +123,8 @@ export function BillingScreen() {
   useEffect(() => {
     const setupSessionId = searchParams.get('setup_session_id');
     const setupCanceled = searchParams.get('setup_canceled');
-    if (setupSessionId) {
-      confirmCardSetup(setupSessionId)
+    if (setupSessionId && activeCompanyId) {
+      confirmCardSetup(setupSessionId, activeCompanyId)
         .then((settings) => {
           applyBillingSettings(settings);
           setNotice({ kind: 'success', text: 'Card saved.' });
@@ -137,8 +142,8 @@ export function BillingScreen() {
   useEffect(() => {
     const subSessionId = searchParams.get('sub_session_id');
     const subCanceled = searchParams.get('sub_canceled');
-    if (subSessionId) {
-      confirmSubscriptionCheckout(subSessionId)
+    if (subSessionId && activeCompanyId) {
+      confirmSubscriptionCheckout(subSessionId, activeCompanyId)
         .then((settings) => {
           applyBillingSettings(settings);
           setNotice({ kind: 'success', text: 'You’re on the monthly plan — bids are unlocked with no per-bid charge.' });
@@ -153,21 +158,24 @@ export function BillingScreen() {
   }, []);
 
   useEffect(() => {
-    getCreditBalanceCents().then(setBalanceCents).catch(() => setBalanceCents(0));
-  }, []);
+    if (!activeCompanyId) return;
+    getCreditBalanceCents(activeCompanyId).then(setBalanceCents).catch(() => setBalanceCents(0));
+  }, [activeCompanyId]);
 
   useEffect(() => {
     getStripeTestMode().then(setTestMode).catch(() => {});
   }, []);
 
   useEffect(() => {
-    getBillingSettings().then(applyBillingSettings).catch(() => {});
-  }, []);
+    if (!activeCompanyId) return;
+    getBillingSettings(activeCompanyId).then(applyBillingSettings).catch(() => {});
+  }, [activeCompanyId]);
 
   const handleTopUp = async (amountCents: number) => {
+    if (!activeCompanyId) return;
     setStarting(amountCents);
     try {
-      const url = await createCreditCheckout(amountCents);
+      const url = await createCreditCheckout(amountCents, activeCompanyId);
       window.location.href = url; // hand off to Stripe-hosted Checkout
     } catch (err) {
       setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not start checkout.' });
@@ -191,9 +199,10 @@ export function BillingScreen() {
   };
 
   const handleAddCard = async () => {
+    if (!activeCompanyId) return;
     setCardBusy(true);
     try {
-      const url = await startCardSetup();
+      const url = await startCardSetup(activeCompanyId);
       window.location.href = url;
     } catch (err) {
       setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not start card setup.' });
@@ -202,9 +211,10 @@ export function BillingScreen() {
   };
 
   const handleRemoveCard = async () => {
+    if (!activeCompanyId) return;
     setCardBusy(true);
     try {
-      applyBillingSettings(await removeSavedCard());
+      applyBillingSettings(await removeSavedCard(activeCompanyId));
     } catch (err) {
       setNotice({ kind: 'error', text: err instanceof Error ? err.message : 'Could not remove card.' });
     } finally {
@@ -213,6 +223,7 @@ export function BillingScreen() {
   };
 
   const handleSaveAutoTopup = async () => {
+    if (!activeCompanyId) return;
     setAutoTopupError(null);
     let thresholdCents: number | undefined;
     let targetCents: number | undefined;
@@ -232,7 +243,7 @@ export function BillingScreen() {
     }
     setSavingAutoTopup(true);
     try {
-      applyBillingSettings(await updateAutoTopup(autoEnabled, thresholdCents, targetCents));
+      applyBillingSettings(await updateAutoTopup(autoEnabled, thresholdCents, targetCents, activeCompanyId));
       setNotice({ kind: 'success', text: autoEnabled ? 'Auto top-up enabled.' : 'Auto top-up disabled.' });
     } catch (err) {
       setAutoTopupError(err instanceof Error ? err.message : 'Could not update auto top-up.');
@@ -242,10 +253,11 @@ export function BillingScreen() {
   };
 
   const handleSwitchToMonthly = async () => {
+    if (!activeCompanyId) return;
     setPlanBusy(true);
     setPlanError(null);
     try {
-      const url = await createSubscriptionCheckout();
+      const url = await createSubscriptionCheckout(activeCompanyId);
       window.location.href = url; // hand off to Stripe-hosted Checkout
     } catch (err) {
       setPlanError(err instanceof Error ? err.message : 'Could not start checkout.');
@@ -254,10 +266,11 @@ export function BillingScreen() {
   };
 
   const handleCancelPlan = async () => {
+    if (!activeCompanyId) return;
     setPlanBusy(true);
     setPlanError(null);
     try {
-      applyBillingSettings(await cancelSubscription());
+      applyBillingSettings(await cancelSubscription(activeCompanyId));
     } catch (err) {
       setPlanError(err instanceof Error ? err.message : 'Could not cancel plan.');
     } finally {
@@ -266,10 +279,11 @@ export function BillingScreen() {
   };
 
   const handleResumePlan = async () => {
+    if (!activeCompanyId) return;
     setPlanBusy(true);
     setPlanError(null);
     try {
-      applyBillingSettings(await resumeSubscription());
+      applyBillingSettings(await resumeSubscription(activeCompanyId));
     } catch (err) {
       setPlanError(err instanceof Error ? err.message : 'Could not resume plan.');
     } finally {
@@ -347,7 +361,7 @@ export function BillingScreen() {
               — unlimited bids, any size, no per-bid charge.
             </p>
 
-            {!isMonthly && (
+            {!isMonthly && isOwner && (
               <button
                 type="button"
                 onClick={handleSwitchToMonthly}
@@ -361,28 +375,32 @@ export function BillingScreen() {
             {isMonthly && !billing?.subscriptionCancelAtPeriodEnd && (
               <div className="mt-3">
                 {renewalDate && <p className="text-xs text-slate-400">Renews {renewalDate}</p>}
-                <button
-                  type="button"
-                  onClick={handleCancelPlan}
-                  disabled={planBusy}
-                  className="mt-2 text-xs font-medium text-red-500 hover:text-red-600 disabled:opacity-40"
-                >
-                  {planBusy ? 'Canceling…' : 'Cancel plan'}
-                </button>
+                {isOwner && (
+                  <button
+                    type="button"
+                    onClick={handleCancelPlan}
+                    disabled={planBusy}
+                    className="mt-2 text-xs font-medium text-red-500 hover:text-red-600 disabled:opacity-40"
+                  >
+                    {planBusy ? 'Canceling…' : 'Cancel plan'}
+                  </button>
+                )}
               </div>
             )}
 
             {isMonthly && billing?.subscriptionCancelAtPeriodEnd && (
               <div className="mt-3">
                 {renewalDate && <p className="text-xs text-amber-600">Ends {renewalDate}</p>}
-                <button
-                  type="button"
-                  onClick={handleResumePlan}
-                  disabled={planBusy}
-                  className="mt-2 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:opacity-50"
-                >
-                  {planBusy ? 'Resuming…' : 'Resume plan'}
-                </button>
+                {isOwner && (
+                  <button
+                    type="button"
+                    onClick={handleResumePlan}
+                    disabled={planBusy}
+                    className="mt-2 rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-blue-500 disabled:cursor-wait disabled:opacity-50"
+                  >
+                    {planBusy ? 'Resuming…' : 'Resume plan'}
+                  </button>
+                )}
               </div>
             )}
           </div>
@@ -396,49 +414,57 @@ export function BillingScreen() {
           {balanceCents == null ? '—' : fmtUsd(balanceCents)}
         </p>
 
-        <p className="mt-6 text-sm font-medium text-slate-700">Add credits</p>
-        <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
-          {TOPUP_PRESETS_CENTS.map((amount) => (
-            <button
-              key={amount}
-              type="button"
-              onClick={() => handleTopUp(amount)}
-              disabled={starting !== null}
-              className="rounded-xl border-2 border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50"
-            >
-              {starting === amount ? 'Redirecting…' : fmtUsd(amount)}
-            </button>
-          ))}
-        </div>
+        {isOwner ? (
+          <>
+            <p className="mt-6 text-sm font-medium text-slate-700">Add credits</p>
+            <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {TOPUP_PRESETS_CENTS.map((amount) => (
+                <button
+                  key={amount}
+                  type="button"
+                  onClick={() => handleTopUp(amount)}
+                  disabled={starting !== null}
+                  className="rounded-xl border-2 border-slate-200 px-4 py-3 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50"
+                >
+                  {starting === amount ? 'Redirecting…' : fmtUsd(amount)}
+                </button>
+              ))}
+            </div>
 
-        <div className="mt-3 flex items-center gap-2">
-          <div className="flex items-center rounded-xl border-2 border-slate-200 px-3 py-2 text-sm focus-within:border-blue-400">
-            <span className="text-slate-400">$</span>
-            <input
-              type="number"
-              min={MIN_TOPUP_CENTS / 100}
-              max={MAX_TOPUP_CENTS / 100}
-              step="1"
-              value={customAmount}
-              onChange={(e) => setCustomAmount(e.target.value)}
-              placeholder="Custom amount"
-              className="ml-1 w-28 text-slate-800 outline-none"
-            />
-          </div>
-          <button
-            type="button"
-            onClick={handleCustomTopUp}
-            disabled={starting !== null || !customAmount}
-            className="rounded-xl border-2 border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50"
-          >
-            Add
-          </button>
-        </div>
-        {customAmountError && <p className="mt-1 text-xs text-red-600">{customAmountError}</p>}
+            <div className="mt-3 flex items-center gap-2">
+              <div className="flex items-center rounded-xl border-2 border-slate-200 px-3 py-2 text-sm focus-within:border-blue-400">
+                <span className="text-slate-400">$</span>
+                <input
+                  type="number"
+                  min={MIN_TOPUP_CENTS / 100}
+                  max={MAX_TOPUP_CENTS / 100}
+                  step="1"
+                  value={customAmount}
+                  onChange={(e) => setCustomAmount(e.target.value)}
+                  placeholder="Custom amount"
+                  className="ml-1 w-28 text-slate-800 outline-none"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={handleCustomTopUp}
+                disabled={starting !== null || !customAmount}
+                className="rounded-xl border-2 border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm transition-colors hover:border-blue-400 hover:text-blue-700 disabled:cursor-wait disabled:opacity-50"
+              >
+                Add
+              </button>
+            </div>
+            {customAmountError && <p className="mt-1 text-xs text-red-600">{customAmountError}</p>}
 
-        <p className="mt-3 text-xs text-slate-400">
-          Secure payment via Stripe.{testMode && ' Test mode.'}
-        </p>
+            <p className="mt-3 text-xs text-slate-400">
+              Secure payment via Stripe.{testMode && ' Test mode.'}
+            </p>
+          </>
+        ) : (
+          <p className="mt-4 text-xs text-slate-400">
+            Only the company owner can buy credits or change the plan.
+          </p>
+        )}
       </div>
 
       <div className="mt-6 rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
@@ -453,7 +479,11 @@ export function BillingScreen() {
           </div>
         )}
 
-        {!billing?.hasSavedCard ? (
+        {!isOwner ? (
+          <p className="mt-4 text-xs text-slate-400">
+            Only the company owner can manage the card and auto top-up.
+          </p>
+        ) : !billing?.hasSavedCard ? (
           <button
             type="button"
             onClick={handleAddCard}

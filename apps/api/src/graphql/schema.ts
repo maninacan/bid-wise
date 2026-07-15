@@ -7,8 +7,8 @@ export const typeDefs = `#graphql
   type Query {
     hello: String
 
-    "Current prepaid credit balance for the signed-in user, in cents."
-    creditBalanceCents: Int!
+    "Current prepaid credit balance for the given company, in cents. Caller must be a member."
+    creditBalanceCents(companyId: ID!): Int!
 
     "Square footage, price, and whether a takeoff's bid is already paid for — drives the Materials/Pricing/Bid payment gate."
     bidQuote(takeoffId: ID!): BidQuote!
@@ -19,8 +19,8 @@ export const typeDefs = `#graphql
     "True if the server's Stripe key is a test-mode key (sk_test_...)."
     stripeTestMode: Boolean!
 
-    "Saved-card and auto top-up configuration for the signed-in user."
-    billingSettings: BillingSettings!
+    "Saved-card and auto top-up configuration for the given company. Caller must be a member; balance/plan are visible to all, only owners can change them."
+    billingSettings(companyId: ID!): BillingSettings!
 
     "Companies the signed-in user belongs to, with their role in each."
     myCompanies: [CompanyMembership!]!
@@ -207,23 +207,23 @@ export const typeDefs = `#graphql
     "Generate the finalized bid PDF and send it via email and/or SMS."
     shareBidPdf(takeoffId: ID!, email: String, phone: String, sharingMode: String): OkResult!
 
-    "Create a Stripe Checkout session to buy the given amount of credits (cents)."
-    createCreditCheckout(amountCents: Int!): CheckoutSession!
+    "Create a Stripe Checkout session to buy the given amount of credits (cents). Owner-only."
+    createCreditCheckout(amountCents: Int!, companyId: ID!): CheckoutSession!
 
-    "Confirm a returned Checkout session and credit the balance (idempotent)."
-    confirmTopup(sessionId: String!): CreditResult!
+    "Confirm a returned Checkout session and credit the balance (idempotent). Owner-only."
+    confirmTopup(sessionId: String!, companyId: ID!): CreditResult!
 
-    "Starts a Stripe Checkout session (setup mode) to save a card for auto top-up."
-    startCardSetup: CheckoutSession!
+    "Starts a Stripe Checkout session (setup mode) to save a card for auto top-up. Owner-only."
+    startCardSetup(companyId: ID!): CheckoutSession!
 
-    "Confirms a returned card-setup session and saves the payment method (idempotent)."
-    confirmCardSetup(sessionId: String!): BillingSettings!
+    "Confirms a returned card-setup session and saves the payment method (idempotent). Owner-only."
+    confirmCardSetup(sessionId: String!, companyId: ID!): BillingSettings!
 
-    "Enables/disables auto top-up. When enabling, thresholdCents/targetCents are required and a card must already be saved."
-    updateAutoTopup(enabled: Boolean!, thresholdCents: Int, targetCents: Int): BillingSettings!
+    "Enables/disables auto top-up. When enabling, thresholdCents/targetCents are required and a card must already be saved. Owner-only."
+    updateAutoTopup(enabled: Boolean!, thresholdCents: Int, targetCents: Int, companyId: ID!): BillingSettings!
 
-    "Removes the saved card and turns off auto top-up."
-    removeSavedCard: BillingSettings!
+    "Removes the saved card and turns off auto top-up. Owner-only."
+    removeSavedCard(companyId: ID!): BillingSettings!
 
     "Charges the prepaid credit balance for this takeoff's square footage (once per takeoff) and unlocks Materials, Pricing, and Bid."
     payForTakeoff(takeoffId: ID!): PayResult!
@@ -231,17 +231,17 @@ export const typeDefs = `#graphql
     "Stamp a paid bid as finalized (locked) — no charge; payment already happened via payForTakeoff."
     finalizeBid(takeoffId: ID!): FinalizeResult!
 
-    "Creates a Stripe Checkout session (subscription mode) for the monthly unlimited-bids plan."
-    createSubscriptionCheckout: CheckoutSession!
+    "Creates a Stripe Checkout session (subscription mode) for the monthly unlimited-bids plan. Owner-only."
+    createSubscriptionCheckout(companyId: ID!): CheckoutSession!
 
-    "Confirms a returned subscription Checkout session and syncs the plan (idempotent)."
-    confirmSubscriptionCheckout(sessionId: String!): BillingSettings!
+    "Confirms a returned subscription Checkout session and syncs the plan (idempotent). Owner-only."
+    confirmSubscriptionCheckout(sessionId: String!, companyId: ID!): BillingSettings!
 
-    "Cancels the monthly plan at the end of the current billing period."
-    cancelSubscription: BillingSettings!
+    "Cancels the monthly plan at the end of the current billing period. Owner-only."
+    cancelSubscription(companyId: ID!): BillingSettings!
 
-    "Undoes a pending cancellation, keeping the monthly plan active."
-    resumeSubscription: BillingSettings!
+    "Undoes a pending cancellation, keeping the monthly plan active. Owner-only."
+    resumeSubscription(companyId: ID!): BillingSettings!
 
     "Creates a new company with the caller as its owner."
     createCompany(name: String!): Company!

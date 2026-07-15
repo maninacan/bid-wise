@@ -754,6 +754,7 @@ async function createCompany(_: unknown, { name }: { name: string }, ctx: GqlCon
   const { data: companyId, error } = await ctx.supabase.rpc('create_company_with_owner', {
     p_name: trimmed,
     p_owner: user.id,
+    p_owner_email: user.email ?? null,
   });
   if (error) throw error;
 
@@ -883,9 +884,9 @@ async function removeTeamMember(
 const MIN_TOPUP_CENTS = 500; // $5
 const MAX_TOPUP_CENTS = 100_000; // $1,000
 
-async function creditBalanceCents(_: unknown, __: unknown, ctx: GqlContext): Promise<number> {
-  const user = await requireUser(ctx);
-  return getBalanceCents(ctx.supabase, user.id);
+async function creditBalanceCents(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext): Promise<number> {
+  await requireCompanyMember(ctx, companyId);
+  return getBalanceCents(ctx.supabase, companyId);
 }
 
 function stripeTestMode(): boolean {
@@ -903,7 +904,7 @@ async function bidQuote(
     .eq('id', takeoffId)
     .maybeSingle();
   if (!takeoff) throw bad('Takeoff not found.');
-  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
+  await requireCompanyMember(ctx, takeoff.company_id);
 
   const alreadyPaid = await isTakeoffPaid(ctx.supabase, takeoffId);
 
@@ -919,7 +920,7 @@ async function bidQuote(
     squareFeet: displaySquareFeet(rawSqFt),
     priceCents,
     alreadyPaid,
-    balanceCents: await getBalanceCents(ctx.supabase, user.id),
+    balanceCents: await getBalanceCents(ctx.supabase, takeoff.company_id),
   };
 }
 
@@ -943,11 +944,11 @@ async function payForTakeoff(
     const priceCents = priceCentsForSquareFeet(rawSqFt);
     if (priceCents == null) throw invalidSquareFeet();
 
-    let balance = await getBalanceCents(ctx.supabase, user.id);
+    let balance = await getBalanceCents(ctx.supabase, takeoff.company_id);
     if (balance < priceCents) {
       // Give auto top-up a chance to cover the shortfall before declaring insufficient credits.
-      await runAutoTopupIfNeeded(ctx.supabase, user.id);
-      balance = await getBalanceCents(ctx.supabase, user.id);
+      await runAutoTopupIfNeeded(ctx.supabase, takeoff.company_id);
+      balance = await getBalanceCents(ctx.supabase, takeoff.company_id);
     }
     if (balance < priceCents) {
       throw new GraphQLError('Not enough credits to unlock this bid.', {
@@ -960,7 +961,8 @@ async function payForTakeoff(
       });
     }
     const { error: chargeErr } = await ctx.supabase.from('credit_transactions').insert({
-      user_id: user.id,
+      company_id: takeoff.company_id,
+      actor_user_id: user.id,
       kind: 'charge',
       amount_cents: -priceCents,
       takeoff_id: takeoffId,
@@ -970,18 +972,18 @@ async function payForTakeoff(
     if (chargeErr && (chargeErr as { code?: string }).code !== UNIQUE_VIOLATION) throw chargeErr;
 
     // This charge may have dropped the balance below the auto top-up threshold — replenish now.
-    await runAutoTopupIfNeeded(ctx.supabase, user.id);
+    await runAutoTopupIfNeeded(ctx.supabase, takeoff.company_id);
   }
 
-  return { balanceCents: await getBalanceCents(ctx.supabase, user.id) };
+  return { balanceCents: await getBalanceCents(ctx.supabase, takeoff.company_id) };
 }
 
 async function createCreditCheckout(
   _: unknown,
-  { amountCents }: { amountCents: number },
+  { amountCents, companyId }: { amountCents: number; companyId: string },
   ctx: GqlContext,
 ): Promise<{ url: string }> {
-  const user = await requireUser(ctx);
+  const user = await requireCompanyOwner(ctx, companyId);
   if (!Number.isInteger(amountCents) || amountCents < MIN_TOPUP_CENTS || amountCents > MAX_TOPUP_CENTS) {
     throw bad(`Top-up must be between $${MIN_TOPUP_CENTS / 100} and $${MAX_TOPUP_CENTS / 100}.`);
   }
@@ -997,7 +999,7 @@ async function createCreditCheckout(
         },
       },
     ],
-    metadata: { userId: user.id, kind: 'credit_topup' },
+    metadata: { companyId, actorUserId: user.id, kind: 'credit_topup' },
     success_url: `${appUrl()}/billing?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${appUrl()}/billing?canceled=1`,
   });
@@ -1007,19 +1009,20 @@ async function createCreditCheckout(
 
 async function confirmTopup(
   _: unknown,
-  { sessionId }: { sessionId: string },
+  { sessionId, companyId }: { sessionId: string; companyId: string },
   ctx: GqlContext,
 ): Promise<{ balanceCents: number }> {
-  const user = await requireUser(ctx);
+  const user = await requireCompanyOwner(ctx, companyId);
   const session = await getStripe().checkout.sessions.retrieve(sessionId);
-  if (session.payment_status === 'paid' && session.metadata?.userId === user.id) {
+  if (session.payment_status === 'paid' && session.metadata?.companyId === companyId) {
     await creditTopup(ctx.supabase, {
-      userId: user.id,
+      companyId,
+      actorUserId: user.id,
       sessionId: session.id,
       amountCents: session.amount_total ?? 0,
     });
   }
-  return { balanceCents: await getBalanceCents(ctx.supabase, user.id) };
+  return { balanceCents: await getBalanceCents(ctx.supabase, companyId) };
 }
 
 function toBillingSettings(customer: BillingCustomer | null) {
@@ -1039,19 +1042,24 @@ function toBillingSettings(customer: BillingCustomer | null) {
   };
 }
 
-async function billingSettings(_: unknown, __: unknown, ctx: GqlContext) {
-  const user = await requireUser(ctx);
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+async function billingSettings(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext) {
+  // Balance/plan are visible to any member (shared wallet) — only the mutations below are owner-gated.
+  await requireCompanyMember(ctx, companyId);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
 // ── Monthly plan / subscription ──────────────────────────────────────────────
 
-async function createSubscriptionCheckout(_: unknown, __: unknown, ctx: GqlContext): Promise<{ url: string }> {
-  const user = await requireUser(ctx);
-  if (hasActiveMonthlySubscription(await getBillingCustomer(ctx.supabase, user.id))) {
+async function createSubscriptionCheckout(
+  _: unknown,
+  { companyId }: { companyId: string },
+  ctx: GqlContext,
+): Promise<{ url: string }> {
+  const user = await requireCompanyOwner(ctx, companyId);
+  if (hasActiveMonthlySubscription(await getBillingCustomer(ctx.supabase, companyId))) {
     throw bad('You already have an active monthly plan.');
   }
-  const customerId = await ensureStripeCustomerId(ctx.supabase, user.id, user.email ?? undefined);
+  const customerId = await ensureStripeCustomerId(ctx.supabase, companyId, user.id, user.email ?? undefined);
   const session = await getStripe().checkout.sessions.create({
     mode: 'subscription',
     customer: customerId,
@@ -1067,9 +1075,9 @@ async function createSubscriptionCheckout(_: unknown, __: unknown, ctx: GqlConte
       },
     ],
     // Metadata on the subscription itself (not just the session) so the webhook can resolve
-    // userId directly from subscription.updated/deleted events without a customer lookup.
-    subscription_data: { metadata: { userId: user.id } },
-    metadata: { userId: user.id, kind: 'subscription' },
+    // companyId directly from subscription.updated/deleted events without a customer lookup.
+    subscription_data: { metadata: { companyId } },
+    metadata: { companyId, actorUserId: user.id, kind: 'subscription' },
     success_url: `${appUrl()}/billing?sub_session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${appUrl()}/billing?sub_canceled=1`,
   });
@@ -1079,47 +1087,47 @@ async function createSubscriptionCheckout(_: unknown, __: unknown, ctx: GqlConte
 
 async function confirmSubscriptionCheckout(
   _: unknown,
-  { sessionId }: { sessionId: string },
+  { sessionId, companyId }: { sessionId: string; companyId: string },
   ctx: GqlContext,
 ) {
-  const user = await requireUser(ctx);
+  await requireCompanyOwner(ctx, companyId);
   const session = await getStripe().checkout.sessions.retrieve(sessionId, { expand: ['subscription'] });
   if (
     session.metadata?.kind === 'subscription' &&
-    session.metadata?.userId === user.id &&
+    session.metadata?.companyId === companyId &&
     session.subscription &&
     typeof session.subscription !== 'string'
   ) {
-    await syncSubscriptionFromStripe(ctx.supabase, user.id, session.subscription);
+    await syncSubscriptionFromStripe(ctx.supabase, companyId, session.subscription);
   }
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
-async function cancelSubscription(_: unknown, __: unknown, ctx: GqlContext) {
-  const user = await requireUser(ctx);
-  const customer = await getBillingCustomer(ctx.supabase, user.id);
+async function cancelSubscription(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext) {
+  await requireCompanyOwner(ctx, companyId);
+  const customer = await getBillingCustomer(ctx.supabase, companyId);
   if (!customer?.stripeSubscriptionId) throw bad('No active subscription to cancel.');
   const subscription = await getStripe().subscriptions.update(customer.stripeSubscriptionId, {
     cancel_at_period_end: true,
   });
-  await syncSubscriptionFromStripe(ctx.supabase, user.id, subscription);
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+  await syncSubscriptionFromStripe(ctx.supabase, companyId, subscription);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
-async function resumeSubscription(_: unknown, __: unknown, ctx: GqlContext) {
-  const user = await requireUser(ctx);
-  const customer = await getBillingCustomer(ctx.supabase, user.id);
+async function resumeSubscription(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext) {
+  await requireCompanyOwner(ctx, companyId);
+  const customer = await getBillingCustomer(ctx.supabase, companyId);
   if (!customer?.stripeSubscriptionId) throw bad('No subscription to resume.');
   const subscription = await getStripe().subscriptions.update(customer.stripeSubscriptionId, {
     cancel_at_period_end: false,
   });
-  await syncSubscriptionFromStripe(ctx.supabase, user.id, subscription);
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+  await syncSubscriptionFromStripe(ctx.supabase, companyId, subscription);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
-async function startCardSetup(_: unknown, __: unknown, ctx: GqlContext): Promise<{ url: string }> {
-  const user = await requireUser(ctx);
-  const customerId = await ensureStripeCustomerId(ctx.supabase, user.id, user.email ?? undefined);
+async function startCardSetup(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext): Promise<{ url: string }> {
+  const user = await requireCompanyOwner(ctx, companyId);
+  const customerId = await ensureStripeCustomerId(ctx.supabase, companyId, user.id, user.email ?? undefined);
   const session = await getStripe().checkout.sessions.create({
     mode: 'setup',
     customer: customerId,
@@ -1127,7 +1135,7 @@ async function startCardSetup(_: unknown, __: unknown, ctx: GqlContext): Promise
     // for other enabled payment method types, and matches what runAutoTopupIfNeeded expects
     // (an off-session card charge) when it later uses the saved payment method.
     payment_method_types: ['card'],
-    metadata: { userId: user.id, kind: 'card_setup' },
+    metadata: { companyId, actorUserId: user.id, kind: 'card_setup' },
     success_url: `${appUrl()}/billing?setup_session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${appUrl()}/billing?setup_canceled=1`,
   });
@@ -1135,24 +1143,33 @@ async function startCardSetup(_: unknown, __: unknown, ctx: GqlContext): Promise
   return { url: session.url };
 }
 
-async function confirmCardSetup(_: unknown, { sessionId }: { sessionId: string }, ctx: GqlContext) {
-  const user = await requireUser(ctx);
+async function confirmCardSetup(
+  _: unknown,
+  { sessionId, companyId }: { sessionId: string; companyId: string },
+  ctx: GqlContext,
+) {
+  await requireCompanyOwner(ctx, companyId);
   const session = await getStripe().checkout.sessions.retrieve(sessionId, { expand: ['setup_intent'] });
-  if (session.metadata?.userId === user.id && session.setup_intent && typeof session.setup_intent !== 'string') {
-    await persistCardFromSetupIntent(ctx.supabase, user.id, session.setup_intent);
+  if (session.metadata?.companyId === companyId && session.setup_intent && typeof session.setup_intent !== 'string') {
+    await persistCardFromSetupIntent(ctx.supabase, companyId, session.setup_intent);
   }
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
 async function updateAutoTopup(
   _: unknown,
-  { enabled, thresholdCents, targetCents }: { enabled: boolean; thresholdCents?: number | null; targetCents?: number | null },
+  { enabled, thresholdCents, targetCents, companyId }: {
+    enabled: boolean;
+    thresholdCents?: number | null;
+    targetCents?: number | null;
+    companyId: string;
+  },
   ctx: GqlContext,
 ) {
-  const user = await requireUser(ctx);
+  await requireCompanyOwner(ctx, companyId);
 
   if (enabled) {
-    const customer = await getBillingCustomer(ctx.supabase, user.id);
+    const customer = await getBillingCustomer(ctx.supabase, companyId);
     if (!customer?.stripePaymentMethodId) throw bad('Save a card before enabling auto top-up.');
     if (!Number.isInteger(thresholdCents) || !Number.isInteger(targetCents)) {
       throw bad('Set a minimum balance and a top-up amount.');
@@ -1166,18 +1183,18 @@ async function updateAutoTopup(
     }
   }
 
-  await setAutoTopup(ctx.supabase, user.id, {
+  await setAutoTopup(ctx.supabase, companyId, {
     enabled,
     thresholdCents: enabled ? thresholdCents! : null,
     targetCents: enabled ? targetCents! : null,
   });
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
-async function removeSavedCard(_: unknown, __: unknown, ctx: GqlContext) {
-  const user = await requireUser(ctx);
-  await removeSavedCardRow(ctx.supabase, user.id);
-  return toBillingSettings(await getBillingCustomer(ctx.supabase, user.id));
+async function removeSavedCard(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext) {
+  await requireCompanyOwner(ctx, companyId);
+  await removeSavedCardRow(ctx.supabase, companyId);
+  return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
 async function finalizeBid(
@@ -1191,7 +1208,7 @@ async function finalizeBid(
     .eq('id', takeoffId)
     .maybeSingle();
   if (!takeoff) throw bad('Takeoff not found.');
-  const { user } = await requireCompanyMember(ctx, takeoff.company_id);
+  await requireCompanyMember(ctx, takeoff.company_id);
 
   const data = takeoff.data as { bid?: { finalizedAt?: string } };
   if (!data.bid) throw bad('Add pricing before finalizing.');
@@ -1214,7 +1231,7 @@ async function finalizeBid(
     .single();
   if (error || !saved) throw new GraphQLError('Finalize failed to save.');
 
-  return { data: saved.data, balanceCents: await getBalanceCents(ctx.supabase, user.id) };
+  return { data: saved.data, balanceCents: await getBalanceCents(ctx.supabase, takeoff.company_id) };
 }
 
 // ── Super-admin dashboard ────────────────────────────────────────────────────

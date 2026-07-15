@@ -1,18 +1,19 @@
 // Shared credit-wallet helpers used by both the GraphQL resolvers and the Stripe webhook.
 // All writes go through the service-role client; idempotency is enforced by unique indexes
 // on credit_transactions (stripe_session_id for top-ups, takeoff_id for charges,
-// stripe_payment_intent_id for auto top-ups).
+// stripe_payment_intent_id for auto top-ups). Company-scoped throughout (decision 2: one
+// Stripe customer, one saved card, one credit balance, one subscription per company).
 import type { SupabaseClient } from '@supabase/supabase-js';
 import { getStripe } from './lib/stripe';
 
 const UNIQUE_VIOLATION = '23505';
 
-/** Current credit balance (cents) for a user. */
-export async function getBalanceCents(supabase: SupabaseClient, userId: string): Promise<number> {
+/** Current credit balance (cents) for a company. */
+export async function getBalanceCents(supabase: SupabaseClient, companyId: string): Promise<number> {
   const { data, error } = await supabase
-    .from('user_credit_balance')
+    .from('company_credit_balance')
     .select('balance_cents')
-    .eq('user_id', userId)
+    .eq('company_id', companyId)
     .maybeSingle();
   if (error) throw error;
   return data?.balance_cents ?? 0;
@@ -20,8 +21,8 @@ export async function getBalanceCents(supabase: SupabaseClient, userId: string):
 
 /**
  * True once a takeoff is unlocked for Materials/Pricing/Bid: either it was already charged (a
- * `charge` row exists, via payForTakeoff) or the takeoff owner currently has an active monthly
- * plan. Owner-scoped rather than caller-scoped so this stays correct when a delegated
+ * `charge` row exists, via payForTakeoff) or the takeoff's company currently has an active
+ * monthly plan. Company-scoped rather than caller-scoped so this stays correct when a delegated
  * subcontractor (not the GC) is the one calling a paid-gated resolver.
  */
 export async function isTakeoffPaid(supabase: SupabaseClient, takeoffId: string): Promise<boolean> {
@@ -36,23 +37,24 @@ export async function isTakeoffPaid(supabase: SupabaseClient, takeoffId: string)
 
   const { data: takeoff, error: takeoffError } = await supabase
     .from('takeoffs')
-    .select('user_id')
+    .select('company_id')
     .eq('id', takeoffId)
     .maybeSingle();
   if (takeoffError) throw takeoffError;
   if (!takeoff) return false;
 
-  return hasActiveMonthlySubscription(await getBillingCustomer(supabase, takeoff.user_id));
+  return hasActiveMonthlySubscription(await getBillingCustomer(supabase, takeoff.company_id));
 }
 
-/** Idempotently credit a paid Stripe Checkout session to the user's balance. Safe to call
+/** Idempotently credit a paid Stripe Checkout session to the company's balance. Safe to call
  *  from both the webhook and the confirm-on-return mutation — the second call no-ops. */
 export async function creditTopup(
   supabase: SupabaseClient,
-  opts: { userId: string; sessionId: string; amountCents: number },
+  opts: { companyId: string; actorUserId: string; sessionId: string; amountCents: number },
 ): Promise<void> {
   const { error } = await supabase.from('credit_transactions').insert({
-    user_id: opts.userId,
+    company_id: opts.companyId,
+    actor_user_id: opts.actorUserId,
     kind: 'topup',
     amount_cents: opts.amountCents,
     stripe_session_id: opts.sessionId,
@@ -89,12 +91,12 @@ export function hasActiveMonthlySubscription(customer: BillingCustomer | null): 
 
 export async function getBillingCustomer(
   supabase: SupabaseClient,
-  userId: string,
+  companyId: string,
 ): Promise<BillingCustomer | null> {
   const { data, error } = await supabase
     .from('billing_customers')
     .select('*')
-    .eq('user_id', userId)
+    .eq('company_id', companyId)
     .maybeSingle();
   if (error) throw error;
   if (!data) return null;
@@ -115,19 +117,29 @@ export async function getBillingCustomer(
   };
 }
 
-/** Returns the user's Stripe Customer ID, creating one (and the billing_customers row) on first use. */
+/** Returns the company's Stripe Customer ID, creating one (and the billing_customers row) on
+ *  first use. Prefers companies.billing_email (set at company creation) over the acting
+ *  member's own email, since the Stripe customer belongs to the company, not one person. */
 export async function ensureStripeCustomerId(
   supabase: SupabaseClient,
-  userId: string,
-  email: string | undefined,
+  companyId: string,
+  actorUserId: string,
+  fallbackEmail: string | undefined,
 ): Promise<string> {
-  const existing = await getBillingCustomer(supabase, userId);
+  const existing = await getBillingCustomer(supabase, companyId);
   if (existing) return existing.stripeCustomerId;
 
-  const customer = await getStripe().customers.create({ email, metadata: { userId } });
+  const { data: company } = await supabase
+    .from('companies')
+    .select('billing_email')
+    .eq('id', companyId)
+    .maybeSingle();
+  const email = company?.billing_email ?? fallbackEmail;
+
+  const customer = await getStripe().customers.create({ email, metadata: { companyId } });
   const { error } = await supabase
     .from('billing_customers')
-    .insert({ user_id: userId, stripe_customer_id: customer.id });
+    .insert({ company_id: companyId, created_by_user_id: actorUserId, stripe_customer_id: customer.id });
   if (error) throw error;
   return customer.id;
 }
@@ -141,7 +153,7 @@ interface SetupIntentLike {
 /** Persists the payment method a completed SetupIntent attached, and makes it the customer's default. */
 export async function persistCardFromSetupIntent(
   supabase: SupabaseClient,
-  userId: string,
+  companyId: string,
   setupIntent: SetupIntentLike,
 ): Promise<void> {
   const paymentMethodId =
@@ -160,7 +172,7 @@ export async function persistCardFromSetupIntent(
       auto_topup_disabled_reason: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('user_id', userId);
+    .eq('company_id', companyId);
   if (error) throw error;
 
   const customerId =
@@ -174,7 +186,7 @@ export async function persistCardFromSetupIntent(
 
 export async function setAutoTopup(
   supabase: SupabaseClient,
-  userId: string,
+  companyId: string,
   opts: { enabled: boolean; thresholdCents: number | null; targetCents: number | null },
 ): Promise<void> {
   const { error } = await supabase
@@ -186,23 +198,23 @@ export async function setAutoTopup(
       auto_topup_disabled_reason: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('user_id', userId);
+    .eq('company_id', companyId);
   if (error) throw error;
 }
 
 export async function disableAutoTopup(
   supabase: SupabaseClient,
-  userId: string,
+  companyId: string,
   reason: string,
 ): Promise<void> {
   const { error } = await supabase
     .from('billing_customers')
     .update({ auto_topup_enabled: false, auto_topup_disabled_reason: reason, updated_at: new Date().toISOString() })
-    .eq('user_id', userId);
+    .eq('company_id', companyId);
   if (error) throw error;
 }
 
-export async function removeSavedCard(supabase: SupabaseClient, userId: string): Promise<void> {
+export async function removeSavedCard(supabase: SupabaseClient, companyId: string): Promise<void> {
   const { error } = await supabase
     .from('billing_customers')
     .update({
@@ -213,7 +225,7 @@ export async function removeSavedCard(supabase: SupabaseClient, userId: string):
       auto_topup_disabled_reason: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('user_id', userId);
+    .eq('company_id', companyId);
   if (error) throw error;
 }
 
@@ -240,7 +252,7 @@ export interface StripeSubscriptionLike {
  */
 export async function syncSubscriptionFromStripe(
   supabase: SupabaseClient,
-  userId: string,
+  companyId: string,
   subscription: StripeSubscriptionLike,
 ): Promise<void> {
   const active = subscription.status === 'active' || subscription.status === 'trialing';
@@ -255,16 +267,16 @@ export async function syncSubscriptionFromStripe(
       subscription_current_period_end: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
       updated_at: new Date().toISOString(),
     })
-    .eq('user_id', userId);
+    .eq('company_id', companyId);
   if (error) throw error;
 }
 
 async function creditAutoTopup(
   supabase: SupabaseClient,
-  opts: { userId: string; paymentIntentId: string; amountCents: number },
+  opts: { companyId: string; paymentIntentId: string; amountCents: number },
 ): Promise<void> {
   const { error } = await supabase.from('credit_transactions').insert({
-    user_id: opts.userId,
+    company_id: opts.companyId,
     kind: 'topup',
     amount_cents: opts.amountCents,
     stripe_payment_intent_id: opts.paymentIntentId,
@@ -273,18 +285,18 @@ async function creditAutoTopup(
 }
 
 /**
- * Checks the user's balance against their configured auto top-up threshold and, if it has
- * dropped below it, charges their saved card off-session to bring it back up to the target.
+ * Checks the company's balance against its configured auto top-up threshold and, if it has
+ * dropped below it, charges the saved card off-session to bring it back up to the target.
  * Never throws — a declined/failed charge just disables auto top-up with a reason the billing
  * screen can surface, so callers (e.g. payForTakeoff) can call this opportunistically without
  * risking the primary flow.
  */
-export async function runAutoTopupIfNeeded(supabase: SupabaseClient, userId: string): Promise<void> {
-  const customer = await getBillingCustomer(supabase, userId);
+export async function runAutoTopupIfNeeded(supabase: SupabaseClient, companyId: string): Promise<void> {
+  const customer = await getBillingCustomer(supabase, companyId);
   if (!customer?.autoTopupEnabled || !customer.stripePaymentMethodId) return;
   if (!customer.autoTopupThresholdCents || !customer.autoTopupTargetCents) return;
 
-  const balance = await getBalanceCents(supabase, userId);
+  const balance = await getBalanceCents(supabase, companyId);
   if (balance >= customer.autoTopupThresholdCents) return;
 
   const amountCents = customer.autoTopupTargetCents - balance;
@@ -298,15 +310,15 @@ export async function runAutoTopupIfNeeded(supabase: SupabaseClient, userId: str
       currency: 'usd',
       off_session: true,
       confirm: true,
-      metadata: { userId, kind: 'auto_topup' },
+      metadata: { companyId, kind: 'auto_topup' },
     });
     if (intent.status === 'succeeded') {
-      await creditAutoTopup(supabase, { userId, paymentIntentId: intent.id, amountCents });
+      await creditAutoTopup(supabase, { companyId, paymentIntentId: intent.id, amountCents });
     } else {
-      await disableAutoTopup(supabase, userId, 'Automatic top-up could not be completed — please check your card.');
+      await disableAutoTopup(supabase, companyId, 'Automatic top-up could not be completed — please check your card.');
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Card was declined.';
-    await disableAutoTopup(supabase, userId, message);
+    await disableAutoTopup(supabase, companyId, message);
   }
 }

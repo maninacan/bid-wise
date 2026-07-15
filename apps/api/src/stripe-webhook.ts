@@ -16,7 +16,7 @@ interface TopupSession {
 }
 
 /** The Subscription fields this handler reads off a subscription.updated/deleted event
- *  (metadata carries userId, set at checkout creation via subscription_data.metadata). */
+ *  (metadata carries companyId, set at checkout creation via subscription_data.metadata). */
 interface SubscriptionEventObject extends StripeSubscriptionLike {
   metadata?: Record<string, string> | null;
 }
@@ -44,35 +44,38 @@ export async function stripeWebhookHandler(req: Request, res: Response): Promise
   try {
     if (event.type === 'checkout.session.completed') {
       const session = event.data.object as unknown as TopupSession;
-      const userId = session.metadata?.userId;
+      const companyId = session.metadata?.companyId;
+      const actorUserId = session.metadata?.actorUserId;
       if (
         session.metadata?.kind === 'credit_topup' &&
-        userId &&
+        companyId &&
+        actorUserId &&
         session.payment_status === 'paid'
       ) {
         await creditTopup(supabaseAdmin, {
-          userId,
+          companyId,
+          actorUserId,
           sessionId: session.id,
           amountCents: session.amount_total ?? 0,
         });
-      } else if (session.metadata?.kind === 'card_setup' && userId) {
+      } else if (session.metadata?.kind === 'card_setup' && companyId) {
         // Backup path in case the browser never returns to confirmCardSetup after redirect.
         const full = await getStripe().checkout.sessions.retrieve(session.id, { expand: ['setup_intent'] });
         if (full.setup_intent && typeof full.setup_intent !== 'string') {
-          await persistCardFromSetupIntent(supabaseAdmin, userId, full.setup_intent);
+          await persistCardFromSetupIntent(supabaseAdmin, companyId, full.setup_intent);
         }
-      } else if (session.metadata?.kind === 'subscription' && userId) {
+      } else if (session.metadata?.kind === 'subscription' && companyId) {
         // Backup path in case the browser never returns to confirmSubscriptionCheckout after redirect.
         const full = await getStripe().checkout.sessions.retrieve(session.id, { expand: ['subscription'] });
         if (full.subscription && typeof full.subscription !== 'string') {
-          await syncSubscriptionFromStripe(supabaseAdmin, userId, full.subscription);
+          await syncSubscriptionFromStripe(supabaseAdmin, companyId, full.subscription);
         }
       }
     } else if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
       const subscription = event.data.object as unknown as SubscriptionEventObject;
-      const userId = subscription.metadata?.userId;
-      if (userId) {
-        await syncSubscriptionFromStripe(supabaseAdmin, userId, subscription);
+      const companyId = subscription.metadata?.companyId;
+      if (companyId) {
+        await syncSubscriptionFromStripe(supabaseAdmin, companyId, subscription);
       }
     }
   } catch (err) {
