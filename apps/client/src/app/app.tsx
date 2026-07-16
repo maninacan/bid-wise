@@ -30,6 +30,7 @@ import { MyWorkScreen } from './my-work-screen';
 import { TradesOnboardingModal } from './trades-onboarding-modal';
 import { BillingScreen, CreditsChip } from './billing-screen';
 import { TeamScreen } from './team-screen';
+import { CompaniesScreen } from './companies-screen';
 import { CompanyOnboardingScreen } from './company-onboarding-screen';
 
 const DEFAULT_SETTINGS: UserSettings = {
@@ -216,6 +217,13 @@ function AppShell({ session }: { session: Session }) {
             >
               Team
             </button>
+            <button
+              type="button"
+              onClick={() => navigate('/companies')}
+              className="rounded-lg px-3 py-2 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700"
+            >
+              Companies
+            </button>
             <CreditsChip />
             <button
               type="button"
@@ -321,6 +329,8 @@ function AppShell({ session }: { session: Session }) {
             />
 
             <Route path="/team" element={<TeamScreen />} />
+
+            <Route path="/companies" element={<CompaniesScreen />} />
 
             <Route path="/accept-invite" element={<AcceptInviteRoute />} />
 
