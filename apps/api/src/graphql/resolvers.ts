@@ -23,6 +23,7 @@ import {
   runAutoTopupIfNeeded,
   hasActiveMonthlySubscription,
   syncSubscriptionFromStripe,
+  applyBalanceToSubscription as applyBalanceToSubscriptionRow,
   type BillingCustomer,
 } from '../billing';
 import { requireUser, requireCompanyMember, requireCompanyOwner, type GqlContext } from './context';
@@ -1144,6 +1145,16 @@ async function resumeSubscription(_: unknown, { companyId }: { companyId: string
   return toBillingSettings(await getBillingCustomer(ctx.supabase, companyId));
 }
 
+async function applyBalanceToSubscription(
+  _: unknown,
+  { companyId }: { companyId: string },
+  ctx: GqlContext,
+): Promise<{ appliedCents: number; balanceCents: number }> {
+  const user = await requireCompanyOwner(ctx, companyId);
+  const { appliedCents } = await applyBalanceToSubscriptionRow(ctx.supabase, { companyId, actorUserId: user.id });
+  return { appliedCents, balanceCents: await getBalanceCents(ctx.supabase, companyId) };
+}
+
 async function startCardSetup(_: unknown, { companyId }: { companyId: string }, ctx: GqlContext): Promise<{ url: string }> {
   const user = await requireCompanyOwner(ctx, companyId);
   const customerId = await ensureStripeCustomerId(ctx.supabase, companyId, user.id, user.email ?? undefined);
@@ -1366,6 +1377,7 @@ export const resolvers = {
     confirmSubscriptionCheckout,
     cancelSubscription,
     resumeSubscription,
+    applyBalanceToSubscription,
     createCompany,
     renameCompany,
     inviteTeamMember,

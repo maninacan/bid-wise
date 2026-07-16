@@ -271,6 +271,62 @@ export async function syncSubscriptionFromStripe(
   if (error) throw error;
 }
 
+/**
+ * Sweeps 100% of the company's current internal credit balance into Stripe's native Customer
+ * Balance, which Stripe automatically applies to reduce the amount due on this customer's
+ * next (and subsequent) invoices — including recurring subscription invoices — before
+ * charging the default payment method. Manual, full-balance-only, owner-initiated (there is
+ * no automatic sweep at plan-switch or topup time). Re-reads the balance fresh at call time so
+ * a second call after a successful sweep sees 0 and rejects, rather than double-sweeping stale
+ * client state.
+ *
+ * Deliberately does NOT swallow errors (unlike runAutoTopupIfNeeded) — this is a user-initiated
+ * action the resolver must surface, not opportunistic background reconciliation.
+ */
+export async function applyBalanceToSubscription(
+  supabase: SupabaseClient,
+  opts: { companyId: string; actorUserId: string },
+): Promise<{ appliedCents: number }> {
+  const { companyId, actorUserId } = opts;
+
+  const customer = await getBillingCustomer(supabase, companyId);
+  if (!hasActiveMonthlySubscription(customer)) {
+    throw new Error('Applying your balance requires an active monthly subscription.');
+  }
+
+  const balanceCents = await getBalanceCents(supabase, companyId);
+  if (balanceCents <= 0) throw new Error('There is no balance to apply.');
+
+  const balanceTransaction = await getStripe().customers.createBalanceTransaction(customer!.stripeCustomerId, {
+    amount: -balanceCents,
+    currency: 'usd',
+    description: `Bid Wise: applied existing credit balance to monthly subscription (company ${companyId})`,
+    metadata: { companyId, kind: 'applied_to_subscription' },
+  });
+
+  const { error } = await supabase.from('credit_transactions').insert({
+    company_id: companyId,
+    actor_user_id: actorUserId,
+    kind: 'applied_to_subscription',
+    amount_cents: -balanceCents,
+  });
+  if (error) {
+    // Stripe already granted the credit — a retry would sweep the same money into Stripe a
+    // second time (a real double-credit, not just a UI glitch). Fail loud rather than
+    // silently retrying; needs manual reconciliation if this ever hits.
+    console.error(
+      `[applyBalanceToSubscription] Stripe balance transaction ${balanceTransaction.id} succeeded for ` +
+        `company ${companyId} but the internal ledger insert failed — needs manual reconciliation:`,
+      error,
+    );
+    throw new Error(
+      'Your balance was applied on Stripe but we could not record it. Do not try again — contact support.',
+    );
+  }
+
+  return { appliedCents: balanceCents };
+}
+
 async function creditAutoTopup(
   supabase: SupabaseClient,
   opts: { companyId: string; paymentIntentId: string; amountCents: number },

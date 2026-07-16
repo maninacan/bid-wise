@@ -1458,6 +1458,36 @@ export async function resumeSubscription(companyId: string): Promise<BillingSett
   }
 }
 
+export interface ApplyBalanceResult {
+  appliedCents: number;
+  balanceCents: number;
+}
+
+const APPLY_BALANCE_TO_SUBSCRIPTION = gql`
+  mutation ApplyBalanceToSubscription($companyId: ID!) {
+    applyBalanceToSubscription(companyId: $companyId) {
+      appliedCents
+      balanceCents
+    }
+  }
+`;
+
+/** Sweeps 100% of the company's internal credit balance into Stripe's Customer Balance, which
+ *  Stripe auto-applies to future monthly invoices. Owner-only; only valid on the monthly plan.
+ *  Irreversible — there is no undo once Stripe has applied the credit. */
+export async function applyBalanceToSubscription(companyId: string): Promise<ApplyBalanceResult> {
+  try {
+    const { data } = await apolloClient.mutate<{ applyBalanceToSubscription: ApplyBalanceResult }>({
+      mutation: APPLY_BALANCE_TO_SUBSCRIPTION,
+      variables: { companyId },
+      context: await authContext(),
+    });
+    return data!.applyBalanceToSubscription;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not apply your balance.'));
+  }
+}
+
 /** Fetches all saved plans in the given company and generates a takeoff for each, scoped
  *  to the given trades. */
 export async function performTakeoffs(companyId: string, trades: string[]): Promise<Takeoff[]> {

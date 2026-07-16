@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import {
+  applyBalanceToSubscription,
   cancelSubscription,
   confirmCardSetup,
   confirmSubscriptionCheckout,
@@ -91,6 +92,8 @@ export function BillingScreen() {
   const [savingAutoTopup, setSavingAutoTopup] = useState(false);
   const [planBusy, setPlanBusy] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [applyingBalance, setApplyingBalance] = useState(false);
+  const [applyBalanceError, setApplyBalanceError] = useState<string | null>(null);
 
   const applyBillingSettings = (settings: BillingSettings) => {
     setBilling(settings);
@@ -291,6 +294,25 @@ export function BillingScreen() {
     }
   };
 
+  const handleApplyBalance = async () => {
+    if (!activeCompanyId) return;
+    setApplyingBalance(true);
+    setApplyBalanceError(null);
+    try {
+      const { balanceCents: newBalance, appliedCents } = await applyBalanceToSubscription(activeCompanyId);
+      setBalanceCents(newBalance);
+      notifyCreditsChanged();
+      setNotice({
+        kind: 'success',
+        text: `Applied ${fmtUsd(appliedCents)} to your subscription — it'll reduce your next invoice(s).`,
+      });
+    } catch (err) {
+      setApplyBalanceError(err instanceof Error ? err.message : 'Could not apply your balance.');
+    } finally {
+      setApplyingBalance(false);
+    }
+  };
+
   const noticeStyles = {
     success: 'border-green-200 bg-green-50 text-green-800',
     canceled: 'border-slate-200 bg-slate-50 text-slate-600',
@@ -413,6 +435,27 @@ export function BillingScreen() {
         <p className="mt-1 text-4xl font-bold tabular-nums text-slate-900">
           {balanceCents == null ? '—' : fmtUsd(balanceCents)}
         </p>
+
+        {isOwner && isMonthly && (balanceCents ?? 0) > 0 && (
+          <div className="mt-4 rounded-xl border border-blue-200 bg-blue-50/40 p-4">
+            <p className="text-sm text-slate-700">
+              You have {fmtUsd(balanceCents!)} in unused per-bid credit sitting idle while you're on the monthly plan.
+            </p>
+            <p className="mt-1 text-xs text-slate-500">
+              Apply it now and Stripe will automatically use it to reduce your next subscription invoice(s) until
+              it's used up. This moves the full balance immediately and cannot be undone.
+            </p>
+            <button
+              type="button"
+              onClick={handleApplyBalance}
+              disabled={applyingBalance}
+              className="mt-3 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-blue-500 disabled:cursor-wait disabled:opacity-50"
+            >
+              {applyingBalance ? 'Applying…' : `Apply ${fmtUsd(balanceCents!)} to subscription`}
+            </button>
+            {applyBalanceError && <p className="mt-2 text-xs text-red-600">{applyBalanceError}</p>}
+          </div>
+        )}
 
         {isOwner ? (
           <>

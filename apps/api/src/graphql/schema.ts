@@ -89,6 +89,13 @@ export const typeDefs = `#graphql
     monthlyPlanPriceCents: Int!
   }
 
+  type ApplyBalanceResult {
+    "Cents swept from the internal balance into Stripe's Customer Balance."
+    appliedCents: Int!
+    "Internal balance after the sweep — always 0 on success."
+    balanceCents: Int!
+  }
+
   type AdminDashboardStats {
     totalUsers: Int!
     totalTakeoffs: Int!
@@ -244,6 +251,9 @@ export const typeDefs = `#graphql
 
     "Undoes a pending cancellation, keeping the monthly plan active. Owner-only."
     resumeSubscription(companyId: ID!): BillingSettings!
+
+    "Sweeps 100% of the company's internal credit balance into Stripe's Customer Balance, which Stripe auto-applies to future subscription invoices. Only allowed on an active monthly plan. Owner-only."
+    applyBalanceToSubscription(companyId: ID!): ApplyBalanceResult!
 
     "Creates a new company with the caller as its owner."
     createCompany(name: String!): Company!
