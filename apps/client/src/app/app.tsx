@@ -31,6 +31,7 @@ import { TradesOnboardingModal } from './trades-onboarding-modal';
 import { BillingScreen, CreditsChip } from './billing-screen';
 import { TeamScreen } from './team-screen';
 import { CompaniesScreen } from './companies-screen';
+import { AvatarMenu } from './avatar-menu';
 import { CompanyOnboardingScreen } from './company-onboarding-screen';
 
 const DEFAULT_SETTINGS: UserSettings = {
@@ -184,9 +185,6 @@ function AppShell({ session }: { session: Session }) {
                 <span className="text-xs font-medium text-slate-500">{activeCompany.company.name}</span>
               )
             )}
-            {session.user.email && (
-              <span className="text-xs text-slate-400">{session.user.email}</span>
-            )}
             <button
               type="button"
               onClick={() => navigate('/projects')}
@@ -225,24 +223,11 @@ function AppShell({ session }: { session: Session }) {
               Companies
             </button>
             <CreditsChip />
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              className="rounded-lg p-2 text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
-              aria-label="Open settings"
-            >
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75">
-                <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
-              </svg>
-            </button>
-            <button
-              type="button"
-              onClick={() => signOut().catch(() => {})}
-              className="rounded-lg px-3 py-2 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700"
-            >
-              Sign out
-            </button>
+            <AvatarMenu
+              email={session.user.email ?? ''}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onSignOut={() => signOut().catch(() => {})}
+            />
           </div>
         </div>
 
