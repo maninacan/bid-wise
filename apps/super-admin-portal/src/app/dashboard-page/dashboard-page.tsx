@@ -6,6 +6,7 @@ import { authContext } from '../../lib/supabase';
 interface RecentTakeoff {
   id: string;
   userEmail: string;
+  companyName: string | null;
   planName: string | null;
   createdAt: string;
 }
@@ -13,6 +14,7 @@ interface RecentTakeoff {
 interface AdminDashboardStats {
   totalUsers: number;
   totalTakeoffs: number;
+  totalCompanies: number;
   totalCreditsToppedUpCents: number;
   totalCreditsSpentCents: number;
   totalAiTokens: number;
@@ -24,12 +26,14 @@ const ADMIN_DASHBOARD_STATS = gql`
     adminDashboardStats {
       totalUsers
       totalTakeoffs
+      totalCompanies
       totalCreditsToppedUpCents
       totalCreditsSpentCents
       totalAiTokens
       recentTakeoffs {
         id
         userEmail
+        companyName
         planName
         createdAt
       }
@@ -104,8 +108,9 @@ export function DashboardPage() {
 
       {stats && (
         <>
-          <div className="mt-6 grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <div className="mt-6 grid grid-cols-2 gap-4 lg:grid-cols-5">
             <KpiCard label="Users" value={stats.totalUsers.toLocaleString()} icon="users" />
+            <KpiCard label="Companies" value={stats.totalCompanies.toLocaleString()} icon="building" />
             <KpiCard label="Takeoffs generated" value={stats.totalTakeoffs.toLocaleString()} icon="ruler-combined" />
             <KpiCard label="Credits topped up" value={formatCents(stats.totalCreditsToppedUpCents)} icon="wallet" />
             <KpiCard label="Credits spent" value={formatCents(stats.totalCreditsSpentCents)} icon="receipt" />
@@ -126,6 +131,7 @@ export function DashboardPage() {
                 <thead>
                   <tr className="text-xs uppercase tracking-wide text-slate-400">
                     <th className="px-5 py-2 font-medium">User</th>
+                    <th className="px-5 py-2 font-medium">Company</th>
                     <th className="px-5 py-2 font-medium">Plan</th>
                     <th className="px-5 py-2 font-medium">Created</th>
                   </tr>
@@ -134,6 +140,7 @@ export function DashboardPage() {
                   {stats.recentTakeoffs.map((t) => (
                     <tr key={t.id} className="border-t border-slate-100">
                       <td className="px-5 py-2.5 text-slate-700">{t.userEmail}</td>
+                      <td className="px-5 py-2.5 text-slate-500">{t.companyName ?? '—'}</td>
                       <td className="px-5 py-2.5 text-slate-500">{t.planName ?? '—'}</td>
                       <td className="px-5 py-2.5 text-slate-500">
                         {new Date(t.createdAt).toLocaleString()}

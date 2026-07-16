@@ -1241,6 +1241,7 @@ interface RecentTakeoffRow {
   user_id: string;
   created_at: string;
   house_plans: { name: string | null; file_name: string } | null;
+  companies: { name: string } | null;
 }
 
 async function adminDashboardStats(_: unknown, __: unknown, ctx: GqlContext) {
@@ -1260,6 +1261,11 @@ async function adminDashboardStats(_: unknown, __: unknown, ctx: GqlContext) {
     .from('takeoffs')
     .select('*', { count: 'exact', head: true });
   if (takeoffCountErr) throw takeoffCountErr;
+
+  const { count: totalCompanies, error: companyCountErr } = await ctx.supabase
+    .from('companies')
+    .select('*', { count: 'exact', head: true });
+  if (companyCountErr) throw companyCountErr;
 
   const { data: creditRows, error: creditErr } = await ctx.supabase
     .from('credit_transactions')
@@ -1284,7 +1290,7 @@ async function adminDashboardStats(_: unknown, __: unknown, ctx: GqlContext) {
 
   const { data: recent, error: recentErr } = await ctx.supabase
     .from('takeoffs')
-    .select('id, user_id, created_at, house_plans(name, file_name)')
+    .select('id, user_id, created_at, house_plans(name, file_name), companies(name)')
     .order('created_at', { ascending: false })
     .limit(10);
   if (recentErr) throw recentErr;
@@ -1292,6 +1298,7 @@ async function adminDashboardStats(_: unknown, __: unknown, ctx: GqlContext) {
   const recentTakeoffs = ((recent ?? []) as unknown as RecentTakeoffRow[]).map((t) => ({
     id: t.id,
     userEmail: emailsById.get(t.user_id) ?? 'unknown',
+    companyName: t.companies?.name ?? null,
     planName: t.house_plans?.name ?? t.house_plans?.file_name ?? null,
     createdAt: t.created_at,
   }));
@@ -1299,6 +1306,7 @@ async function adminDashboardStats(_: unknown, __: unknown, ctx: GqlContext) {
   return {
     totalUsers: emailsById.size,
     totalTakeoffs: totalTakeoffs ?? 0,
+    totalCompanies: totalCompanies ?? 0,
     totalCreditsToppedUpCents,
     totalCreditsSpentCents,
     totalAiTokens,

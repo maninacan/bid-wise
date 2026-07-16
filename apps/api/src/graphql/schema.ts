@@ -92,6 +92,7 @@ export const typeDefs = `#graphql
   type AdminDashboardStats {
     totalUsers: Int!
     totalTakeoffs: Int!
+    totalCompanies: Int!
     "Sum of all Stripe credit top-ups, in cents."
     totalCreditsToppedUpCents: Int!
     "Sum of all per-bid credit charges, in cents."
@@ -105,6 +106,7 @@ export const typeDefs = `#graphql
   type RecentTakeoff {
     id: ID!
     userEmail: String!
+    companyName: String
     planName: String
     createdAt: String!
   }
