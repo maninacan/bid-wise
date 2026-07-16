@@ -767,6 +767,25 @@ async function createCompany(_: unknown, { name }: { name: string }, ctx: GqlCon
   return toCompany(company);
 }
 
+async function renameCompany(
+  _: unknown,
+  { companyId, name }: { companyId: string; name: string },
+  ctx: GqlContext,
+) {
+  await requireCompanyMember(ctx, companyId);
+  const trimmed = name?.trim();
+  if (!trimmed) throw bad('Company name is required.');
+
+  const { data: company, error } = await ctx.supabase
+    .from('companies')
+    .update({ name: trimmed })
+    .eq('id', companyId)
+    .select('id, name, billing_email, created_at')
+    .single();
+  if (error || !company) throw new GraphQLError('Could not rename company.');
+  return toCompany(company);
+}
+
 async function inviteTeamMember(
   _: unknown,
   { companyId, email }: { companyId: string; email: string },
@@ -1348,6 +1367,7 @@ export const resolvers = {
     cancelSubscription,
     resumeSubscription,
     createCompany,
+    renameCompany,
     inviteTeamMember,
     revokeInvite,
     acceptInvite,

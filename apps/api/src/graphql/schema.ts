@@ -248,6 +248,9 @@ export const typeDefs = `#graphql
     "Creates a new company with the caller as its owner."
     createCompany(name: String!): Company!
 
+    "Renames a company. Any member may call this — shared business info, no money/membership angle."
+    renameCompany(companyId: ID!, name: String!): Company!
+
     "Invites a teammate by email. Owner-only."
     inviteTeamMember(companyId: ID!, email: String!): CompanyInvite!
 

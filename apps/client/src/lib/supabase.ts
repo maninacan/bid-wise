@@ -164,6 +164,26 @@ export async function createCompany(name: string): Promise<Company> {
   }
 }
 
+const RENAME_COMPANY = gql`
+  mutation RenameCompany($companyId: ID!, $name: String!) {
+    renameCompany(companyId: $companyId, name: $name) { id name billingEmail createdAt }
+  }
+`;
+
+/** Renames a company. Any member may call this. */
+export async function renameCompany(companyId: string, name: string): Promise<Company> {
+  try {
+    const { data } = await apolloClient.mutate<{ renameCompany: Company }>({
+      mutation: RENAME_COMPANY,
+      variables: { companyId, name },
+      context: await authContext(),
+    });
+    return data!.renameCompany;
+  } catch (error) {
+    throw new Error(gqlErrorMessage(error, 'Could not rename company.'));
+  }
+}
+
 const INVITE_TEAM_MEMBER = gql`
   mutation InviteTeamMember($companyId: ID!, $email: String!) {
     inviteTeamMember(companyId: $companyId, email: $email) {
