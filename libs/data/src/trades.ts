@@ -1,7 +1,7 @@
 import { contractorQuestionnaire } from './questionnaire/index.js';
 
 export interface Trade {
-  /** Stable slug — the questionnaire choice value, also stored in `user_settings.trades`. */
+  /** Stable slug — the questionnaire choice value, also stored in `company_settings.trades`. */
   value: string;
   /** Human-readable display name — shown in the UI and stored as the subcontractor trade tag. */
   label: string;
