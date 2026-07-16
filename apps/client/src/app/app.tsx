@@ -208,23 +208,11 @@ function AppShell({ session }: { session: Session }) {
             >
               Subs
             </button>
-            <button
-              type="button"
-              onClick={() => navigate('/team')}
-              className="rounded-lg px-3 py-2 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700"
-            >
-              Team
-            </button>
-            <button
-              type="button"
-              onClick={() => navigate('/companies')}
-              className="rounded-lg px-3 py-2 text-sm font-medium text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-700"
-            >
-              Companies
-            </button>
             <CreditsChip />
             <AvatarMenu
               email={session.user.email ?? ''}
+              onOpenTeam={() => navigate('/team')}
+              onOpenCompanies={() => navigate('/companies')}
               onOpenSettings={() => setSettingsOpen(true)}
               onSignOut={() => signOut().catch(() => {})}
             />

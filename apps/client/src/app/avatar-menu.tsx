@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 
 interface AvatarMenuProps {
   email: string;
+  onOpenTeam: () => void;
+  onOpenCompanies: () => void;
   onOpenSettings: () => void;
   onSignOut: () => void;
 }
@@ -11,8 +13,9 @@ function initialFor(email: string): string {
 }
 
 /** Header account menu: an initials avatar that opens a dropdown with the user's email
- *  (display-only), Settings, and Sign out. Closes on outside click, Escape, or item select. */
-export function AvatarMenu({ email, onOpenSettings, onSignOut }: AvatarMenuProps) {
+ *  (display-only), Team, Companies, Settings, and Sign out. Closes on outside click, Escape,
+ *  or item select. */
+export function AvatarMenu({ email, onOpenTeam, onOpenCompanies, onOpenSettings, onSignOut }: AvatarMenuProps) {
   const [open, setOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -58,6 +61,37 @@ export function AvatarMenu({ email, onOpenSettings, onSignOut }: AvatarMenuProps
           <button
             type="button"
             role="menuitem"
+            onClick={() => { setOpen(false); onOpenTeam(); }}
+            className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-slate-600 transition-colors hover:bg-slate-50"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" className="shrink-0">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+            Team
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => { setOpen(false); onOpenCompanies(); }}
+            className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-slate-600 transition-colors hover:bg-slate-50"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" className="shrink-0">
+              <rect x="3" y="3" width="18" height="18" rx="1" />
+              <path d="M9 21v-6h6v6" />
+              <path d="M7 7h2M11 7h2M15 7h2M7 11h2M11 11h2M15 11h2" />
+            </svg>
+            Companies
+          </button>
+
+          <div className="my-1 border-t border-slate-100" />
+
+          <button
+            type="button"
+            role="menuitem"
             onClick={() => { setOpen(false); onOpenSettings(); }}
             className="flex w-full items-center gap-2.5 px-4 py-2 text-left text-sm text-slate-600 transition-colors hover:bg-slate-50"
           >
@@ -67,6 +101,8 @@ export function AvatarMenu({ email, onOpenSettings, onSignOut }: AvatarMenuProps
             </svg>
             Settings
           </button>
+
+          <div className="my-1 border-t border-slate-100" />
 
           <button
             type="button"
